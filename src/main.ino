@@ -30,11 +30,12 @@
 #include <TouchDrvGT911.hpp>
 #include "Epub.h"
 
-// Phase E: WiFi AP + on-board web server
+// Phase E: WiFi AP + on-board web server (async — sync WebServer.h dies after
+// a couple of back-to-back requests; AsyncWebServer handles concurrency).
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
 #include <DNSServer.h>
+#include <ESPAsyncWebServer.h>
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
@@ -299,42 +300,49 @@ static void chapter_load_task(void *param) {
     vTaskDelete(NULL);
 }
 
-// SD path "/<book-without-extension>.pos" for the selected book.
-static String pos_path_for_selected() {
-    String name = String(books[selected].c_str());
+// SD path "/<book-without-extension>.pos" for any book by filename.
+static String pos_path_for_name(const String &name) {
     int dot = name.lastIndexOf('.');
     if (dot <= 0) dot = name.length();
     return String("/") + name.substring(0, dot) + ".pos";
 }
 
-static void save_position() {
-    if (selected < 0 || selected >= (int)books.size()) return;
-    String path = pos_path_for_selected();
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) { Serial.printf("save_position: open %s failed\n", path.c_str()); return; }
-    f.printf("%d %d\n", current_spine, current_page_in_chapter);
-    f.close();
-    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d\n",
-                  path.c_str(), current_spine, current_page_in_chapter);
-}
-
-// Returns true if a position was loaded; sets *out_spine and *out_page.
-static bool load_position(int *out_spine, int *out_page) {
-    if (selected < 0 || selected >= (int)books.size()) return false;
-    String path = pos_path_for_selected();
-    File f = SD.open(path, FILE_READ);
+static bool read_position_for_name(const String &name, int *out_spine, int *out_page) {
+    File f = SD.open(pos_path_for_name(name), FILE_READ);
     if (!f) return false;
     String line = f.readStringUntil('\n');
     f.close();
-    int sp_idx = -1, pg_idx = -1;
-    if (sscanf(line.c_str(), "%d %d", &sp_idx, &pg_idx) == 2) {
-        *out_spine = sp_idx;
-        *out_page = pg_idx;
-        Serial.printf("[POS_LOADED] %s -> ch=%d p=%d\n",
-                      path.c_str(), sp_idx, pg_idx);
+    int sp = -1, pg = -1;
+    if (sscanf(line.c_str(), "%d %d", &sp, &pg) == 2) {
+        *out_spine = sp;
+        *out_page = pg;
         return true;
     }
     return false;
+}
+
+static bool write_position_for_name(const String &name, int spine, int page) {
+    String path = pos_path_for_name(name);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { Serial.printf("write_position: open %s failed\n", path.c_str()); return false; }
+    f.printf("%d %d\n", spine, page);
+    f.close();
+    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d\n", path.c_str(), spine, page);
+    return true;
+}
+
+static void save_position() {
+    if (selected < 0 || selected >= (int)books.size()) return;
+    write_position_for_name(String(books[selected].c_str()),
+                            current_spine, current_page_in_chapter);
+}
+
+static bool load_position(int *out_spine, int *out_page) {
+    if (selected < 0 || selected >= (int)books.size()) return false;
+    bool ok = read_position_for_name(String(books[selected].c_str()),
+                                     out_spine, out_page);
+    if (ok) Serial.printf("[POS_LOADED] ch=%d p=%d\n", *out_spine, *out_page);
+    return ok;
 }
 
 // Spawn the load task and wait for it.
@@ -607,7 +615,7 @@ static void open_selected() {
 
 // ---- Phase E: WiFi AP + web upload server ----
 
-static WebServer *web_server = nullptr;
+static AsyncWebServer *web_server = nullptr;
 static DNSServer *dns_server = nullptr;
 static bool ap_active = false;
 static String ap_ssid;
@@ -636,7 +644,14 @@ static String ap_build_books_json() {
                 String esc = name;
                 esc.replace("\\", "\\\\");
                 esc.replace("\"", "\\\"");
-                json += "{\"name\":\"" + esc + "\",\"size\":" + String(f.size()) + "}";
+                int sp = 0, pg = 0;
+                bool has_pos = read_position_for_name(name, &sp, &pg);
+                json += "{\"name\":\"" + esc + "\"";
+                json += ",\"size\":" + String(f.size());
+                json += ",\"spine\":" + String(sp);
+                json += ",\"page\":" + String(pg);
+                json += ",\"hasPos\":" + String(has_pos ? "true" : "false");
+                json += "}";
             }
         }
         f.close();
@@ -687,13 +702,17 @@ static const char AP_INDEX_HTML[] PROGMEM = R"HTML(
 <style>
 body{font-family:-apple-system,sans-serif;max-width:640px;margin:0 auto;padding:1em;}
 h1{font-size:1.4em;}
-.book{padding:.6em;border-bottom:1px solid #ccc;display:flex;align-items:center;gap:.5em;}
+.book{padding:.6em;border-bottom:1px solid #ccc;}
+.book-row{display:flex;align-items:center;gap:.5em;}
 .book-name{flex:1;word-break:break-all;}
-.book-size{color:#666;font-size:.85em;}
-button{font-size:1em;padding:.4em .8em;}
+.book-meta{color:#666;font-size:.85em;display:flex;gap:.6em;margin-top:.2em;}
+button{font-size:.95em;padding:.4em .8em;}
+.btn-link{background:none;border:none;color:#06c;padding:0;cursor:pointer;text-decoration:underline;}
 form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 .danger{background:#fee;color:#900;border:1px solid #c66;}
 .muted{color:#666;font-size:.9em;}
+.editor{margin-top:.4em;padding:.4em;background:#f5f5f5;border-radius:4px;display:flex;align-items:center;gap:.4em;flex-wrap:wrap;}
+.editor input{width:5em;font-size:1em;padding:.2em;}
 </style></head><body>
 <h1>tiny-reader</h1>
 <div id=books class=muted>loading...</div>
@@ -704,11 +723,50 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 <div id=status class=muted></div>
 </form>
 <script>
+ var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
+ var jsq=function(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");};
  var load=function(){
   fetch('/api/books').then(function(r){return r.json();}).then(function(list){
    var d=document.getElementById('books');
-   d.innerHTML=list.length? list.map(function(b){return '<div class=book><span class=book-name>'+b.name+'</span><span class=book-size>'+(b.size/1024).toFixed(0)+'KB</span><a href="/api/books/'+encodeURIComponent(b.name)+'" download>download</a> <button class=danger onclick="del(\''+b.name+'\')">delete</button></div>';}).join('') : '<p class=muted>(empty)</p>';
+   if(!list.length){d.innerHTML='<p class=muted>(empty)</p>';return;}
+   d.innerHTML=list.map(function(b){
+    var pos = b.hasPos? ('ch '+(b.spine+1)+', page '+(b.page+1)) : 'not started';
+    return '<div class=book>'+
+     '<div class=book-row>'+
+      '<span class=book-name>'+esc(b.name)+'</span>'+
+      '<button class=danger onclick="del(\''+jsq(b.name)+'\')">delete</button>'+
+     '</div>'+
+     '<div class=book-meta>'+
+      '<span>'+(b.size/1024).toFixed(0)+'KB</span>'+
+      '<span>'+pos+'</span>'+
+      '<a href="/api/books/'+encodeURIComponent(b.name)+'" download>download</a>'+
+      '<button class=btn-link onclick="editPos(\''+jsq(b.name)+'\','+b.spine+','+b.page+')">edit position</button>'+
+     '</div>'+
+     '<div class=editor id="ed-'+esc(b.name)+'" style="display:none"></div>'+
+    '</div>';
+   }).join('');
   });
+ };
+ var editPos=function(name,sp,pg){
+  var sel='#ed-'+CSS.escape(name);
+  var ed=document.querySelector(sel);
+  ed.style.display='flex';
+  ed.innerHTML='chapter <input id=sp value='+(sp+1)+' min=1> page <input id=pg value='+(pg+1)+' min=1> '+
+   '<button class=btn-link onclick="savePos(\''+jsq(name)+'\')">save</button>'+
+   '<button class=btn-link onclick="cancelPos(\''+jsq(name)+'\')">cancel</button>';
+ };
+ var cancelPos=function(name){
+  var ed=document.querySelector('#ed-'+CSS.escape(name));
+  ed.style.display='none'; ed.innerHTML='';
+ };
+ var savePos=function(name){
+  var ed=document.querySelector('#ed-'+CSS.escape(name));
+  var sp=Math.max(0,parseInt(ed.querySelector('#sp').value,10)-1);
+  var pg=Math.max(0,parseInt(ed.querySelector('#pg').value,10)-1);
+  var fd=new URLSearchParams(); fd.append('spine',sp); fd.append('page',pg);
+  fetch('/api/books/'+encodeURIComponent(name)+'/pos',
+        {method:'POST',body:fd,headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){if(r.ok){load();}else{alert('save failed');}});
  };
  var upload=function(e){
   e.preventDefault();
@@ -730,76 +788,106 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 </script></body></html>
 )HTML";
 
-static void ap_handle_root() {
+// Async handlers below take AsyncWebServerRequest *req.
+static void ap_handle_root(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    web_server->send_P(200, "text/html", AP_INDEX_HTML);
+    req->send_P(200, "text/html", AP_INDEX_HTML);
 }
-static void ap_handle_books_json() {
+static void ap_handle_books_json(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    web_server->send(200, "application/json", ap_build_books_json());
+    String json = ap_build_books_json();
+    Serial.printf("[HTTP] GET /api/books -> %d bytes\n", json.length());
+    req->send(200, "application/json", json);
 }
-static void ap_handle_upload_progress() {
+
+// Multipart upload: AsyncWebServer calls back per-chunk.
+static void ap_handle_upload_chunk(AsyncWebServerRequest *req, String filename,
+                                   size_t index, uint8_t *data, size_t len, bool final) {
     ap_last_activity = millis();
-    HTTPUpload &u = web_server->upload();
-    if (u.status == UPLOAD_FILE_START) {
-        String path = String("/") + u.filename;
+    if (index == 0) {
+        String path = String("/") + filename;
         if (SD.exists(path)) SD.remove(path);
         ap_upload_file = SD.open(path, FILE_WRITE);
         Serial.printf("[UPLOAD] start %s\n", path.c_str());
-    } else if (u.status == UPLOAD_FILE_WRITE) {
-        if (ap_upload_file) ap_upload_file.write(u.buf, u.currentSize);
-    } else if (u.status == UPLOAD_FILE_END) {
-        if (ap_upload_file) {
-            ap_upload_file.close();
-            Serial.printf("[UPLOAD] done %u bytes\n", (unsigned)u.totalSize);
-        }
+    }
+    if (ap_upload_file && len) {
+        ap_upload_file.write(data, len);
+    }
+    if (final) {
+        if (ap_upload_file) ap_upload_file.close();
+        Serial.printf("[UPLOAD] done %u bytes\n", (unsigned)(index + len));
     }
 }
-static void ap_handle_upload_done() {
-    web_server->send(200, "application/json", "{\"ok\":true}");
+static void ap_handle_upload_done(AsyncWebServerRequest *req) {
+    req->send(200, "application/json", "{\"ok\":true}");
 }
-static void ap_handle_book_path() {
+
+// Common /api/books/<name>... handler
+static void ap_handle_book_path(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    String uri = web_server->uri();
+    String uri = req->url();
     if (!uri.startsWith("/api/books/")) {
-        web_server->send(404, "text/plain", "not found");
+        req->send(404, "text/plain", "not found");
         return;
     }
-    String name = uri.substring(strlen("/api/books/"));
-    name = web_server->urlDecode(name);
+    String tail = uri.substring(strlen("/api/books/"));
+    String name = tail, action;
+    int slash = tail.lastIndexOf('/');
+    if (slash > 0) {
+        action = tail.substring(slash + 1);
+        name = tail.substring(0, slash);
+    }
+    // AsyncWebServer auto-decodes URI; it's already decoded in url()
     String path = String("/") + name;
-    if (web_server->method() == HTTP_DELETE) {
+
+    if (action == "pos") {
+        if (req->method() == HTTP_GET) {
+            int sp = 0, pg = 0;
+            bool ok = read_position_for_name(name, &sp, &pg);
+            char buf[80];
+            snprintf(buf, sizeof(buf), "{\"spine\":%d,\"page\":%d,\"saved\":%s}",
+                     sp, pg, ok ? "true" : "false");
+            req->send(200, "application/json", buf);
+        } else if (req->method() == HTTP_POST) {
+            int sp = 0, pg = 0;
+            if (req->hasParam("spine", true)) sp = req->getParam("spine", true)->value().toInt();
+            if (req->hasParam("page",  true)) pg = req->getParam("page",  true)->value().toInt();
+            if (sp < 0) sp = 0;
+            if (pg < 0) pg = 0;
+            bool ok = write_position_for_name(name, sp, pg);
+            req->send(ok ? 200 : 500, "application/json",
+                      ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
+        } else {
+            req->send(405, "text/plain", "method not allowed");
+        }
+        return;
+    }
+
+    if (req->method() == HTTP_DELETE) {
         if (SD.exists(path)) {
             SD.remove(path);
-            // also remove sidecar .pos
-            int dot = name.lastIndexOf('.');
-            if (dot > 0) {
-                String pos_path = String("/") + name.substring(0, dot) + ".pos";
-                if (SD.exists(pos_path)) SD.remove(pos_path);
-            }
-            web_server->send(200, "application/json", "{\"ok\":true}");
+            String pos_path = pos_path_for_name(name);
+            if (SD.exists(pos_path)) SD.remove(pos_path);
+            req->send(200, "application/json", "{\"ok\":true}");
         } else {
-            web_server->send(404, "application/json", "{\"error\":\"not found\"}");
+            req->send(404, "application/json", "{\"error\":\"not found\"}");
         }
     } else {
-        File f = SD.open(path, FILE_READ);
-        if (!f) {
-            web_server->send(404, "application/json", "{\"error\":\"not found\"}");
+        if (!SD.exists(path)) {
+            req->send(404, "application/json", "{\"error\":\"not found\"}");
             return;
         }
-        web_server->streamFile(f, "application/epub+zip");
-        f.close();
+        req->send(SD, path, "application/epub+zip");
     }
 }
 
-static void ap_handle_not_found() {
-    String uri = web_server->uri();
-    if (uri.startsWith("/api/books/")) { ap_handle_book_path(); return; }
-    // Captive-portal probes: redirect everything to our index so the phone
-    // recognises this as a portal and doesn't switch back to mobile data.
+static void ap_handle_not_found(AsyncWebServerRequest *req) {
+    String uri = req->url();
+    if (uri.startsWith("/api/books/")) { ap_handle_book_path(req); return; }
     Serial.printf("[HTTP] catchall %s\n", uri.c_str());
-    web_server->sendHeader("Location", "/", true);
-    web_server->send(302, "text/plain", "");
+    AsyncWebServerResponse *r = req->beginResponse(302, "text/plain", "");
+    r->addHeader("Location", "/");
+    req->send(r);
 }
 
 static uint32_t ap_started_at = 0;
@@ -821,9 +909,9 @@ static void enter_ap_mode() {
     ap_ssid = AP_SSID_FIXED;
     ap_password = AP_PASSWORD_FIXED;
 
-    WiFi.onEvent(on_wifi_event);
     WiFi.mode(WIFI_AP);
     WiFi.softAP(ap_ssid.c_str(), ap_password.c_str());
+    WiFi.setSleep(false);   // keep radio on; AP power-save drops connections.
     delay(200);
 
     IPAddress ip = WiFi.softAPIP();
@@ -837,15 +925,38 @@ static void enter_ap_mode() {
     if (!MDNS.begin(MDNS_HOSTNAME)) Serial.println("[AP] mDNS begin failed");
     MDNS.addService("http", "tcp", 80);
 
-    web_server = new WebServer(80);
+    web_server = new AsyncWebServer(80);
     web_server->on("/", HTTP_GET, ap_handle_root);
     web_server->on("/api/books", HTTP_GET, ap_handle_books_json);
-    web_server->on("/upload", HTTP_POST,
-                   ap_handle_upload_done, ap_handle_upload_progress);
-    // Captive-portal probes from Apple/Android/Microsoft
-    web_server->on("/generate_204", HTTP_GET, ap_handle_root);
-    web_server->on("/hotspot-detect.html", HTTP_GET, ap_handle_root);
-    web_server->on("/connecttest.txt", HTTP_GET, ap_handle_root);
+    web_server->on("/ping", HTTP_GET, [](AsyncWebServerRequest *r) {
+        Serial.println("[HTTP] GET /ping");
+        r->send(200, "text/plain", "pong");
+    });
+    // /upload — multipart POST, called as upload chunks stream in
+    web_server->on("/upload", HTTP_POST, ap_handle_upload_done,
+                   ap_handle_upload_chunk);
+    // Captive-portal probes — return what each OS expects so the device
+    // considers the network "online" and doesn't restrict fetches.
+    web_server->on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204, "text/plain", "");
+    });
+    web_server->on("/gen_204", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204, "text/plain", "");
+    });
+    web_server->on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html",
+            "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    });
+    web_server->on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html",
+            "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    });
+    web_server->on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft Connect Test");
+    });
+    web_server->on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft NCSI");
+    });
     web_server->onNotFound(ap_handle_not_found);
     web_server->begin();
 
@@ -863,7 +974,7 @@ static void exit_ap_mode() {
     if (!ap_active) return;
     Serial.println("[AP] exit_ap_mode() called");
     if (web_server) {
-        web_server->stop();
+        web_server->end();
         delete web_server;
         web_server = nullptr;
     }
@@ -934,6 +1045,9 @@ void setup() {
     // strobe (see ed047tc1.h: CFG_STR = GPIO_NUM_0). Configuring it as a button
     // input fights the display driver's output mode and the screen stops
     // refreshing. So we don't use STR_100 as a button. See backlog #15.
+
+    // Register WiFi event callback once (was inside enter_ap_mode → stacked).
+    WiFi.onEvent(on_wifi_event);
 
     scan_sd_for_epubs();
     clear_and_flush();
@@ -1025,7 +1139,7 @@ void loop() {
     // ---- AP / web-server mode ----
     if (ap_active) {
         if (dns_server) dns_server->processNextRequest();
-        web_server->handleClient();
+        // AsyncWebServer runs its own task; no handleClient() needed.
         if (now - ap_last_activity > AP_IDLE_TIMEOUT_MS) {
             Serial.println("[AP] idle timeout");
             exit_ap_mode();
