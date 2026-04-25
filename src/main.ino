@@ -981,7 +981,7 @@ static void render_chapter_jump() {
     draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
     int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
     writeln((GFXfont *)&firasans_small,
-            "tap a row to jump   -   tap top to cancel",
+            "tap a row to jump   -   tap top-left/right to page   -   tap top-center to cancel",
             &fx, &fy, framebuffer);
 
     epd_poweron();
@@ -2063,9 +2063,25 @@ void loop() {
                     }
                 } else if (app_mode == MODE_CHAPTER_JUMP) {
                     if (ys[0] > EPD_HEIGHT - 80) {
-                        // Cancel back to book
-                        app_mode = MODE_BOOK;
-                        render_book_page();
+                        // Top strip: paginate or cancel.
+                        int total = (int)g_toc_cache.size();
+                        int total_pages =
+                            (total + CJ_ROWS_PER_PAGE - 1) / CJ_ROWS_PER_PAGE;
+                        if (total_pages > 1 && xs[0] < 200) {
+                            cj_first -= CJ_ROWS_PER_PAGE;
+                            if (cj_first < 0) cj_first = 0;
+                            render_chapter_jump();
+                        } else if (total_pages > 1 &&
+                                   xs[0] > EPD_WIDTH - 200) {
+                            int next = cj_first + CJ_ROWS_PER_PAGE;
+                            if (next < total) {
+                                cj_first = next;
+                                render_chapter_jump();
+                            }
+                        } else {
+                            app_mode = MODE_BOOK;
+                            render_book_page();
+                        }
                     } else {
                         int hit = chapter_jump_hit_test(xs[0], ys[0]);
                         if (hit >= 0 && hit < total_spine) {
