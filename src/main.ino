@@ -916,7 +916,8 @@ static void render_book_list() {
 // MODE_BOOK. Tap top edge cancels. Falls back to a numeric grid if the
 // book has no NCX TOC.
 static const int CJ_ROW_HEIGHT = 50;
-static const int CJ_ROWS_PER_PAGE = 8;
+static const int CJ_ROWS_PER_PAGE = 7;   // 8 caused the last row's descender
+                                         // to clip into the footer divider
 static int cj_first = 0;   // first TOC entry shown (for paging if > 8)
 
 static void render_chapter_jump() {
