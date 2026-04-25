@@ -1328,13 +1328,44 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
  };
  var upload=function(e){
   e.preventDefault();
+  var st=document.getElementById('status');
   var f=e.target.file.files[0]; if(!f) return;
-  var fd=new FormData(); fd.append('file',f);
-  document.getElementById('status').textContent='uploading...';
-  fetch('/upload',{method:'POST',body:fd}).then(function(r){
-   if(r.ok){document.getElementById('status').textContent='done';load();}
-   else r.text().then(function(t){document.getElementById('status').textContent='failed: '+t;});
-  });
+  var CHUNK=32*1024;
+  var totalKB=(f.size/1024).toFixed(0);
+  var postChunk=function(url,body,attempt){
+   attempt=attempt||1;
+   var ctrl=new AbortController();
+   var t=setTimeout(function(){ctrl.abort();},15000);
+   return fetch(url,{method:'POST',body:body,
+                     headers:{'Content-Type':'application/octet-stream'},
+                     signal:ctrl.signal})
+    .then(function(r){clearTimeout(t); if(!r.ok) throw new Error('HTTP '+r.status); return r;})
+    .catch(function(err){
+     clearTimeout(t);
+     if(attempt<3){
+      st.textContent='retry '+attempt+' ('+err.message+')';
+      return new Promise(function(res){setTimeout(res,500*attempt);})
+              .then(function(){return postChunk(url,body,attempt+1);});
+     }
+     throw err;
+    });
+  };
+  var sendNext=function(offset){
+   if(offset>=f.size){
+    postChunk('/api/upload_chunk?name='+encodeURIComponent(f.name)+'&offset='+f.size+'&final=1',new Blob([]))
+     .then(function(){ st.textContent='done '+totalKB+' KB'; load(); })
+     .catch(function(err){ st.textContent='final marker failed: '+err.message; });
+    return;
+   }
+   var endOff=Math.min(offset+CHUNK,f.size);
+   var chunk=f.slice(offset,endOff);
+   var pct=((endOff/f.size)*100).toFixed(0);
+   st.textContent='uploading '+pct+'% ('+(endOff/1024).toFixed(0)+'/'+totalKB+' KB)';
+   postChunk('/api/upload_chunk?name='+encodeURIComponent(f.name)+'&offset='+offset,chunk)
+    .then(function(){ setTimeout(function(){sendNext(endOff);},50); })
+    .catch(function(err){ st.textContent='upload failed @ '+offset+': '+err.message; });
+  };
+  sendNext(0);
  };
  var del=function(n){
   if(!confirm('delete '+n+'?')) return;
@@ -1573,25 +1604,74 @@ static void ap_handle_books_json(AsyncWebServerRequest *req) {
     req->send(200, "application/json", json);
 }
 
-// Multipart upload: AsyncWebServer calls back per-chunk.
-static void ap_handle_upload_chunk(AsyncWebServerRequest *req, String filename,
-                                   size_t index, uint8_t *data, size_t len, bool final) {
+// /api/upload_chunk — chunked upload: each chunk is its own POST with raw
+// body, so each TCP connection is fresh and the lwIP per-connection
+// receive-window cap (~80 KB on this stack) doesn't accumulate.
+//   query: name=<filename>  offset=<bytes>  final=1 (on last chunk)
+//   body : raw chunk bytes
+// The body callback only memcpy's into a PSRAM buffer (fast, never blocks
+// AsyncTCP). The done handler does the SD write once per chunk.
+static const size_t CHUNK_BUF_SIZE = 64 * 1024;
+static uint8_t *g_chunk_buf = nullptr;
+static size_t   g_chunk_used = 0;
+static bool     g_chunk_overflow = false;
+
+static void ap_handle_chunk_body(AsyncWebServerRequest *req, uint8_t *data,
+                                 size_t len, size_t index, size_t total) {
     ap_last_activity = millis();
     if (index == 0) {
-        String path = String("/") + filename;
-        if (SD.exists(path)) SD.remove(path);
-        ap_upload_file = SD.open(path, FILE_WRITE);
-        Serial.printf("[UPLOAD] start %s\n", path.c_str());
+        if (!g_chunk_buf) g_chunk_buf = (uint8_t *)ps_malloc(CHUNK_BUF_SIZE);
+        g_chunk_used = 0;
+        g_chunk_overflow = false;
     }
-    if (ap_upload_file && len) {
-        ap_upload_file.write(data, len);
-    }
-    if (final) {
-        if (ap_upload_file) ap_upload_file.close();
-        Serial.printf("[UPLOAD] done %u bytes\n", (unsigned)(index + len));
+    if (g_chunk_buf && len) {
+        if (g_chunk_used + len <= CHUNK_BUF_SIZE) {
+            memcpy(g_chunk_buf + g_chunk_used, data, len);
+            g_chunk_used += len;
+        } else {
+            g_chunk_overflow = true;
+        }
     }
 }
-static void ap_handle_upload_done(AsyncWebServerRequest *req) {
+
+static void ap_handle_chunk_done(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    if (!req->hasParam("name") || !req->hasParam("offset")) {
+        req->send(400, "application/json", "{\"error\":\"missing name/offset\"}");
+        return;
+    }
+    if (g_chunk_overflow) {
+        req->send(413, "application/json", "{\"error\":\"chunk too large\"}");
+        return;
+    }
+    String name   = req->getParam("name")->value();
+    size_t offset = (size_t)req->getParam("offset")->value().toInt();
+    bool   is_final = req->hasParam("final");
+    String path = String("/") + name;
+
+    // First chunk truncates an existing file; subsequent chunks append.
+    if (offset == 0 && SD.exists(path)) SD.remove(path);
+    File f = SD.open(path, FILE_APPEND);
+    if (!f) {
+        Serial.printf("[CHUNK] SD.open %s FAILED\n", path.c_str());
+        req->send(500, "application/json", "{\"error\":\"sd open failed\"}");
+        return;
+    }
+    size_t wrote = (g_chunk_used > 0) ? f.write(g_chunk_buf, g_chunk_used) : 0;
+    f.flush();
+    f.close();
+    Serial.printf("[CHUNK] %s @%u +%u%s heap=%u psram=%u\n", path.c_str(),
+                  (unsigned)offset, (unsigned)wrote,
+                  is_final ? " (final)" : "",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getFreePsram());
+    Serial.flush();
+
+    // Keep-alive: do NOT force Connection: close. Closing per chunk burns
+    // through lwIP's tiny TIME_WAIT pool (CONFIG_LWIP_MAX_ACTIVE_TCP=16,
+    // 2*MSL=120s) after ~14 chunks. Reusing one connection avoids that.
+    // The receive-window stall (80 KB cap) doesn't bite here because
+    // browser pauses between chunks waiting for this response.
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -1731,9 +1811,12 @@ static void enter_ap_mode() {
         Serial.println("[HTTP] GET /ping");
         r->send(200, "text/plain", "pong");
     });
-    // /upload — multipart POST, called as upload chunks stream in
-    web_server->on("/upload", HTTP_POST, ap_handle_upload_done,
-                   ap_handle_upload_chunk);
+    // /api/upload_chunk — chunked uploader. Empty multipart-upload callback
+    // because we use the raw-body path (chunk body is binary, not multipart).
+    web_server->on("/api/upload_chunk", HTTP_POST, ap_handle_chunk_done,
+                   [](AsyncWebServerRequest *, const String &, size_t,
+                      uint8_t *, size_t, bool) {},
+                   ap_handle_chunk_body);
     // Captive-portal probes — return what each OS expects so the device
     // considers the network "online" and doesn't restrict fetches.
     web_server->on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *r) {
@@ -1775,7 +1858,11 @@ static void exit_ap_mode() {
     Serial.println("[AP] exit_ap_mode() called");
     if (web_server) {
         web_server->end();
-        delete web_server;
+        // INTENTIONALLY NOT DELETED. Deleting while a request callback is
+        // still mid-flight (e.g. the user closed the page mid-upload, or
+        // the idle timeout fires during a chunk POST) causes a
+        // LoadProhibited NULL-pointer crash inside AsyncWebServer. The
+        // ~few-KB leak per AP cycle is harmless on this 8 MB-PSRAM board.
         web_server = nullptr;
     }
     if (dns_server) {
