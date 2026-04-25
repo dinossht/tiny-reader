@@ -556,6 +556,18 @@ static void render_book_page_text(int x_start, int target_w, int32_t y0, uint8_t
     }
 }
 
+// Draw a 1-px horizontal black line at row y, x range [x0, x1).
+// 4-bit packed framebuffer: even pixel = low nibble, odd pixel = high nibble.
+static void draw_hline(int y, int x0, int x1, uint8_t *fb) {
+    if (y < 0 || y >= EPD_HEIGHT) return;
+    if (x0 < 0) x0 = 0;
+    if (x1 > EPD_WIDTH) x1 = EPD_WIDTH;
+    for (int x = x0; x < x1; ++x) {
+        int idx = (y * EPD_WIDTH + x) / 2;
+        fb[idx] &= (x & 1) ? 0x0F : 0xF0;
+    }
+}
+
 // Strip the .epub extension from the selected book filename; "Foo.epub" -> "Foo".
 static std::string short_title_for_selected() {
     if (selected < 0 || selected >= (int)books.size()) return "";
@@ -585,6 +597,8 @@ static void render_book_page() {
         : 0;
     const GFXfont *small = (const GFXfont *)&firasans_small;
     int32_t footer_y = EPD_HEIGHT - 12;
+    // divider just above the footer text
+    draw_hline(EPD_HEIGHT - 42, BOOK_MARGIN_X, EPD_WIDTH - BOOK_MARGIN_X, framebuffer);
     char left[24], center[40], right[24];
     snprintf(left, sizeof(left), "%d%%", read_battery_percent());
     snprintf(center, sizeof(center), "Ch %d/%d  -  %d%% read",
@@ -718,7 +732,8 @@ static void render_book_list() {
         }
     }
 
-    // footer: tap zones legend in the smaller font.
+    // footer: tap zones legend in the smaller font, with a divider above.
+    draw_hline(EPD_HEIGHT - 80, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
     cx = LIST_X;
     cy = EPD_HEIGHT - 50;
     writeln((GFXfont *)&firasans_small,
