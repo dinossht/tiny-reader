@@ -66,7 +66,7 @@ static int total_spine = 0;
 static int current_page_in_chapter = 0;
 static std::vector<std::string> chapter_pages;  // each entry = one page of \n-separated lines
 static const int BOOK_MARGIN_X = 50;
-static const int BOOK_TOP_RESERVE = 30;     // small visual margin only
+static const int BOOK_TOP_RESERVE = 70;     // header strip with book title + small gap
 static const int BOOK_FOOTER_RESERVE = 50;
 // Layout values that depend on the user's "density" setting (see g_settings).
 // FiraSans advance_y is 50 — line_height < 50 would overlap glyphs.
@@ -553,6 +553,15 @@ static void render_book_page_text(int x_start, int target_w, int32_t y0, uint8_t
     }
 }
 
+// Strip the .epub extension from the selected book filename; "Foo.epub" -> "Foo".
+static std::string short_title_for_selected() {
+    if (selected < 0 || selected >= (int)books.size()) return "";
+    std::string n = books[selected];
+    size_t dot = n.rfind(".epub");
+    if (dot != std::string::npos) n.erase(dot);
+    return n;
+}
+
 static void render_book_page() {
     if (chapter_pages.empty()) return;
     if (current_page_in_chapter < 0) current_page_in_chapter = 0;
@@ -561,21 +570,39 @@ static void render_book_page() {
     dump_current_page_to_serial();
 
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    // Header strip — book title at top. The top 80px is also the
+    // tap-back-to-library zone, which now has visible content.
+    {
+        std::string title = short_title_for_selected();
+        if (title.size() > 56) title = title.substr(0, 53) + "...";
+        int32_t hx = BOOK_MARGIN_X, hy = 40;
+        writeln((GFXfont *)&FiraSans, title.c_str(), &hx, &hy, framebuffer);
+        // Thin underline divider at y = 60 to delimit header from body.
+        for (int x = BOOK_MARGIN_X; x < EPD_WIDTH - BOOK_MARGIN_X; ++x) {
+            int idx = (60 * EPD_WIDTH + x) / 2;
+            framebuffer[idx] &= (x & 1) ? 0x0F : 0xF0;
+        }
+    }
+
     int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
-    // 3-column footer at bottom: [battery]   [chapter]   [page]
+    // 3-column footer: [battery%] [Ch X/Y · NN%] [page A/B]
+    int book_progress_pct = (total_spine > 0)
+        ? (current_spine * 100) / total_spine
+        : 0;
     int32_t footer_y = EPD_HEIGHT - 15;
-    char left[24], center[24], right[24];
+    char left[24], center[40], right[24];
     snprintf(left, sizeof(left), "%d%%", read_battery_percent());
-    snprintf(center, sizeof(center), "Chapter %d/%d", current_spine + 1, total_spine);
-    snprintf(right, sizeof(right), "%d/%d",
+    snprintf(center, sizeof(center), "Ch %d/%d  -  %d%% read",
+             current_spine + 1, total_spine, book_progress_pct);
+    snprintf(right, sizeof(right), "p %d/%d",
              current_page_in_chapter + 1, (int)chapter_pages.size());
 
     int32_t lx = BOOK_MARGIN_X, ly = footer_y;
     writeln((GFXfont *)&FiraSans, left, &lx, &ly, framebuffer);
 
-    // measure center to actually center it
     int32_t cw, ch_ = 0, cmx = 0, cmy = 0, cmx1, cmy1;
     get_text_bounds((GFXfont *)&FiraSans, center, &cmx, &cmy, &cmx1, &cmy1, &cw, &ch_, NULL);
     int32_t cx_ = (EPD_WIDTH - cw) / 2, cy_ = footer_y;
@@ -644,31 +671,66 @@ static void render_book_list() {
 
     int32_t cx = LIST_X, cy = LIST_Y;
     char header[96];
-    snprintf(header, sizeof(header), "Library  (%u books)", (unsigned)books.size());
+    snprintf(header, sizeof(header), "Library  (%u %s)",
+             (unsigned)books.size(),
+             books.size() == 1 ? "book" : "books");
     writeln((GFXfont *)&FiraSans, header, &cx, &cy, framebuffer);
 
-    int total_pages = (books.size() + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
-    int cur_page = page_first / LINES_PER_PAGE;
-    cx = EPD_WIDTH - 240;
-    cy = LIST_Y;
-    char pageinfo[32];
-    snprintf(pageinfo, sizeof(pageinfo), "page %d / %d", cur_page + 1, total_pages > 0 ? total_pages : 1);
-    writeln((GFXfont *)&FiraSans, pageinfo, &cx, &cy, framebuffer);
+    if (books.empty()) {
+        cx = LIST_X; cy = LIST_Y + 120;
+        writeln((GFXfont *)&FiraSans, "No books on the SD card.",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy = LIST_Y + 180;
+        writeln((GFXfont *)&FiraSans,
+                "Hold the button >= 2s to enter WiFi share mode,",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy = LIST_Y + 240;
+        writeln((GFXfont *)&FiraSans,
+                "then upload .epub files via the hub.",
+                &cx, &cy, framebuffer);
+    } else {
+        int total_pages = (books.size() + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
+        int cur_page = page_first / LINES_PER_PAGE;
+        cx = EPD_WIDTH - 240;
+        cy = LIST_Y;
+        char pageinfo[32];
+        snprintf(pageinfo, sizeof(pageinfo), "page %d / %d",
+                 cur_page + 1, total_pages > 0 ? total_pages : 1);
+        writeln((GFXfont *)&FiraSans, pageinfo, &cx, &cy, framebuffer);
 
-    int row = 0;
-    for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
-        cx = LIST_X + 40;
-        cy = LIST_Y + 60 + row * LINE_HEIGHT;
-        const char *prefix = ((int)i == selected) ? "> " : "  ";
-        std::string line = std::string(prefix) + books[i];
-        writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
+        int row = 0;
+        for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
+            const char *prefix = ((int)i == selected) ? ">" : " ";
+            // Title line
+            cx = LIST_X + 40;
+            cy = LIST_Y + 60 + row * LINE_HEIGHT;
+            std::string title = books[i];
+            size_t dot = title.rfind(".epub");
+            if (dot != std::string::npos) title.erase(dot);
+            if (title.size() > 48) title = title.substr(0, 45) + "...";
+            std::string line = std::string(prefix) + " " + title;
+            writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
+
+            // Saved position, right-aligned
+            int sp = 0, pg = 0;
+            if (read_position_for_name(String(books[i].c_str()), &sp, &pg)) {
+                char info[40];
+                snprintf(info, sizeof(info), "ch %d  p %d", sp + 1, pg + 1);
+                int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+                get_text_bounds((GFXfont *)&FiraSans, info,
+                                &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+                int32_t rx = EPD_WIDTH - LIST_X - mw;
+                int32_t ry = LIST_Y + 60 + row * LINE_HEIGHT;
+                writeln((GFXfont *)&FiraSans, info, &rx, &ry, framebuffer);
+            }
+        }
     }
 
     // footer: tap zones legend
     cx = LIST_X;
     cy = EPD_HEIGHT - 30;
     writeln((GFXfont *)&FiraSans,
-            "tap left = prev   tap center = open   tap right = next",
+            "tap left/right = navigate   tap center = open   hold button 2s = WiFi   5s = sleep",
             &cx, &cy, framebuffer);
 
     epd_poweron();
@@ -771,31 +833,44 @@ static String ap_build_books_json() {
 
 static void render_ap_screen() {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
-    int32_t cx = 60, cy = 80;
-    writeln((GFXfont *)&FiraSans, "WiFi Share Mode", &cx, &cy, framebuffer);
 
-    char line[160];
-    cx = 60; cy = 180;
-    snprintf(line, sizeof(line), "SSID:     %s", ap_ssid.c_str());
+    // Title
+    int32_t cx = 60, cy = 70;
+    writeln((GFXfont *)&FiraSans, "tiny-reader hub", &cx, &cy, framebuffer);
+
+    // Underline
+    for (int x = 60; x < EPD_WIDTH - 60; ++x) {
+        int idx = (90 * EPD_WIDTH + x) / 2;
+        framebuffer[idx] &= (x & 1) ? 0x0F : 0xF0;
+    }
+
+    // 1. Connect
+    cx = 60; cy = 160;
+    writeln((GFXfont *)&FiraSans, "1.  Connect to this WiFi network:",
+            &cx, &cy, framebuffer);
+    char line[200];
+    cx = 100; cy = 215;
+    snprintf(line, sizeof(line), "SSID:      %s", ap_ssid.c_str());
+    writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
+    cx = 100; cy = 265;
+    snprintf(line, sizeof(line), "Password:  %s", ap_password.c_str());
     writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
 
-    cx = 60; cy = 240;
-    snprintf(line, sizeof(line), "Password: %s", ap_password.c_str());
-    writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
-
-    cx = 60; cy = 300;
-    snprintf(line, sizeof(line), "URL:      http://tiny-reader.local");
-    writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
-
-    cx = 60; cy = 360;
-    snprintf(line, sizeof(line), "or        http://%s",
+    // 2. Open URL
+    cx = 60; cy = 340;
+    writeln((GFXfont *)&FiraSans, "2.  Open in any browser:",
+            &cx, &cy, framebuffer);
+    cx = 100; cy = 395;
+    snprintf(line, sizeof(line), "http://%s",
              WiFi.softAPIP().toString().c_str());
     writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
 
+    // Footer
     cx = 60; cy = EPD_HEIGHT - 30;
-    writeln((GFXfont *)&FiraSans,
-            "Press button to exit (also auto-exits after 5 min idle)",
-            &cx, &cy, framebuffer);
+    snprintf(line, sizeof(line),
+             "Hold button >= 1.5s to exit  -  auto-exits after %d min idle",
+             g_settings.ap_idle_minutes);
+    writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
 
     epd_poweron();
     epd_clear();
