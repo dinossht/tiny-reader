@@ -793,7 +793,7 @@ static void render_book_list() {
     cx = LIST_X;
     cy = EPD_HEIGHT - 50;
     writeln((GFXfont *)&firasans_small,
-            "tap left/right = navigate   tap center = open   tap top-right = TODO",
+            "tap left/right = navigate   tap center = open   tap bottom-right = TODO",
             &cx, &cy, framebuffer);
     cx = LIST_X;
     cy = EPD_HEIGHT - 12;
@@ -862,7 +862,7 @@ static void render_todo_list() {
     draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
     int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
     writeln((GFXfont *)&firasans_small,
-            "tap top-right to return to library    button = same",
+            "tap bottom-right or center to return to library    button = same",
             &fx, &fy, framebuffer);
 
     epd_poweron();
@@ -1859,25 +1859,29 @@ void loop() {
                 Serial.printf("tap (%d,%d) zone=%d mode=%d\n",
                               xs[0], ys[0], zone, app_mode);
                 Serial.flush();
-                // Top-right corner (x > EPD_WIDTH - 100, y < 80) toggles TODO view
-                // from library, and exits TODO view back to library.
-                bool top_right = (xs[0] > EPD_WIDTH - 100 && ys[0] < 80);
+                // Bottom-right corner toggles TODO view from library, and
+                // exits TODO view back to library. (Touch orientation makes
+                // the top-right corner unreliable; bottom-right is solid.)
+                bool corner_right = (xs[0] > EPD_WIDTH - 100 &&
+                                     ys[0] > EPD_HEIGHT - 100);
                 if (app_mode == MODE_TODO) {
-                    if (top_right || zone == 2) {
+                    if (corner_right || zone == 2) {
                         Serial.println("[TAP] exit TODO -> library");
                         app_mode = MODE_LIBRARY;
                         render_book_list();
                     }
                 } else if (app_mode == MODE_BOOK) {
-                    if (ys[0] < 80) {
+                    // Touch coord origin is bottom-left of screen, so the
+                    // user's *top* strip is high Y, not low Y.
+                    if (ys[0] > EPD_HEIGHT - 80) {
                         Serial.println("[TAP] top → back to library");
                         app_mode = MODE_LIBRARY;
                         render_book_list();
                     } else if (xs[0] < EPD_WIDTH / 2) book_prev_page();
                     else book_next_page();
                 } else {  // MODE_LIBRARY
-                    if (top_right) {
-                        Serial.println("[TAP] top-right -> TODO view");
+                    if (corner_right) {
+                        Serial.println("[TAP] bottom-right -> TODO view");
                         app_mode = MODE_TODO;
                         render_todo_list();
                     } else if (zone == 1) move_selection(-1);
