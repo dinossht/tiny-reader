@@ -39,6 +39,8 @@
 #include <esp_netif.h>
 #include <lwip/ip4_addr.h>
 #include <esp_sleep.h>
+#include <driver/rtc_io.h>
+#include <Preferences.h>
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
@@ -1223,8 +1225,13 @@ static void exit_ap_mode() {
 
 void setup() {
     Serial.begin(115200);
-    delay(200);
-    Serial.println("\ntiny-reader starting");
+    // Detect wake-from-deep-sleep: USB-CDC takes ~1.5s to re-enumerate on the
+    // host, so logs printed before that get lost. Give it time.
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    bool from_sleep = (wake_cause != ESP_SLEEP_WAKEUP_UNDEFINED);
+    delay(from_sleep ? 1800 : 200);
+    Serial.printf("\ntiny-reader starting (wake_cause=%d%s)\n",
+                  (int)wake_cause, from_sleep ? " [post-sleep]" : "");
 
     // SD card on built-in slot
     SPI.begin(SD_SCLK, SD_MISO, SD_MOSI);
@@ -1283,20 +1290,26 @@ void setup() {
 
     // If the last shutdown was from sleep while reading a book, auto-resume.
     bool resumed_from_sleep = false;
-    File lb = SD.open("/last_book.txt", FILE_READ);
-    if (lb) {
-        String last = lb.readString();
-        lb.close();
-        last.trim();
+    {
+        Preferences prefs;
+        prefs.begin("tinyreader", true);   // read-only
+        String last = prefs.getString("last_book", "");
+        prefs.end();
+        Serial.printf("[WAKE] NVS last_book = '%s' (%d bytes)\n",
+                      last.c_str(), last.length());
         if (last.length() > 0) {
             for (size_t i = 0; i < books.size(); ++i) {
                 if (last == books[i].c_str()) {
                     selected = (int)i;
-                    Serial.printf("[WAKE] auto-opening last book: %s\n", last.c_str());
+                    Serial.printf("[WAKE] auto-opening idx=%d: %s\n",
+                                  (int)i, last.c_str());
                     open_selected();   // .pos resume happens inside
                     resumed_from_sleep = true;
                     break;
                 }
+            }
+            if (!resumed_from_sleep) {
+                Serial.println("[WAKE] last book not in library, showing list");
             }
         }
     }
@@ -1318,20 +1331,19 @@ static void enter_deep_sleep() {
     Serial.println("[SLEEP] entering deep sleep");
     Serial.flush();
 
+    // Persist the currently-open book name to NVS (durable across deep sleep
+    // — SD-write caches can lose the marker if we sleep right after).
+    Preferences prefs;
+    prefs.begin("tinyreader", false);
     if (app_mode == MODE_BOOK) {
         save_position();
-        // Persist the currently-open book filename so wake-from-sleep can
-        // re-open it directly instead of dropping into the library list.
-        File f = SD.open("/last_book.txt", FILE_WRITE);
-        if (f) {
-            f.print(books[selected].c_str());
-            f.close();
-            Serial.printf("[SLEEP] last_book = %s\n", books[selected].c_str());
-        }
+        prefs.putString("last_book", books[selected].c_str());
+        Serial.printf("[SLEEP] last_book NVS = %s\n", books[selected].c_str());
     } else {
-        // Not in a book — clear any previous marker so wake just lands in library.
-        if (SD.exists("/last_book.txt")) SD.remove("/last_book.txt");
+        prefs.remove("last_book");
+        Serial.println("[SLEEP] cleared last_book NVS");
     }
+    prefs.end();
 
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
     int32_t cx = 60, cy = 200;
@@ -1347,9 +1359,30 @@ static void enter_deep_sleep() {
     epd_draw_grayscale_image(epd_full_screen(), framebuffer);
     epd_poweroff();
 
-    // Wake on BUTTON_1 (GPIO 21) pulled LOW. The pin idles HIGH via the
-    // INPUT_PULLUP we set in setup(); pressing the button drives it LOW.
+    // Wait for the button to be released before arming wake — otherwise ext0
+    // sees it still LOW and wakes the chip immediately, looking like sleep
+    // never happened.
+    Serial.println("[SLEEP] waiting for button release...");
+    Serial.flush();
+    uint32_t wait_start = millis();
+    while (digitalRead(BUTTON_1) == LOW) {
+        delay(20);
+        if (millis() - wait_start > 10000) break;  // safety bail
+    }
+    delay(150);   // debounce after release
+
+    // Wake on BUTTON_1 (GPIO 21) pulled LOW. The Arduino INPUT_PULLUP we set
+    // earlier is gated on the digital GPIO peripheral, which is powered down
+    // during deep sleep. Explicitly enable the RTC-domain pull-up so the pin
+    // stays HIGH while sleeping (otherwise it floats LOW → ext0 fires
+    // immediately → "sleep" appears to do nothing).
+    rtc_gpio_init(GPIO_NUM_21);
+    rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pulldown_dis(GPIO_NUM_21);
+    rtc_gpio_pullup_en(GPIO_NUM_21);
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_21, 0);
+    Serial.println("[SLEEP] arming ext0 wake on GPIO 21 (RTC pull-up on), sleeping");
     Serial.flush();
     esp_deep_sleep_start();   // does not return
 }
