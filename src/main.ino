@@ -38,6 +38,7 @@
 #include <ESPAsyncWebServer.h>
 #include <esp_netif.h>
 #include <lwip/ip4_addr.h>
+#include <esp_sleep.h>
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
@@ -76,6 +77,26 @@ static struct Settings {
     int density;           // 0=compact, 1=medium (default), 2=loose
     int ap_idle_minutes;   // default 5
 } g_settings = { 1, 5 };
+
+// STR_100 button on GPIO 0 shares the EPD CFG_STR strobe line. We can't hold
+// pinMode(0, INPUT_PULLUP) without breaking display refresh, so instead we
+// briefly flip the pin when the EPD is electrically idle (right after
+// epd_poweroff()), sample it, then restore CFG_STR to OUTPUT/HIGH (the idle
+// state push_cfg() leaves it in). Latched here, consumed in loop(). See
+// backlog #15.
+static volatile bool str100_pressed = false;
+
+// Caller MUST guarantee the EPD is idle (e.g. just after epd_poweroff()).
+// Returns true if STR_100 is held down at the moment of sampling.
+static bool sample_str100_button() {
+    pinMode(0, INPUT_PULLUP);
+    delayMicroseconds(50);
+    bool down = (digitalRead(0) == LOW);
+    delayMicroseconds(50);
+    pinMode(0, OUTPUT);
+    digitalWrite(0, HIGH);
+    return down;
+}
 
 static void apply_density() {
     switch (g_settings.density) {
@@ -567,6 +588,13 @@ static void render_book_page() {
     epd_clear();
     epd_draw_grayscale_image(epd_full_screen(), framebuffer);
     epd_poweroff();
+
+    // EPD is now electrically idle — safe window to peek at GPIO 0 (STR_100).
+    // We latch a flag rather than acting here so loop() consumes it.
+    if (sample_str100_button()) {
+        Serial.println("[STR_100] press detected (post-render)");
+        str100_pressed = true;
+    }
 }
 
 // Advance/go-back a page; cross chapter boundaries by loading next/prev spine item.
@@ -645,6 +673,14 @@ static void render_book_list() {
     epd_clear();
     epd_draw_grayscale_image(epd_full_screen(), framebuffer);
     epd_poweroff();
+
+    // Same idle-window peek as render_book_page(). In library mode the latch
+    // is a debug-log only (see loop()), but we still keep it warm so the user
+    // gets feedback if the wiring works.
+    if (sample_str100_button()) {
+        Serial.println("[STR_100] press detected (library post-render)");
+        str100_pressed = true;
+    }
 }
 
 static void move_selection(int delta) {
@@ -1230,10 +1266,11 @@ void setup() {
     }
 
     pinMode(BUTTON_1, INPUT_PULLUP);   // SENSOR_VN, GPIO 21
-    // NOTE: STR_100 button is on GPIO 0 — but GPIO 0 is also the EPD CFG_STR
-    // strobe (see ed047tc1.h: CFG_STR = GPIO_NUM_0). Configuring it as a button
-    // input fights the display driver's output mode and the screen stops
-    // refreshing. So we don't use STR_100 as a button. See backlog #15.
+    // NOTE: STR_100 button is on GPIO 0, which is also the EPD CFG_STR strobe
+    // (see ed047tc1.h: CFG_STR = GPIO_NUM_0). We can't hold it as a button
+    // input. Instead, sample_str100_button() flips the pin to INPUT_PULLUP
+    // for ~100µs after each epd_poweroff() and restores it to OUTPUT/HIGH —
+    // see render_book_page() / render_book_list(). Backlog #15.
 
     // Register WiFi event callback once (was inside enter_ap_mode → stacked).
     WiFi.onEvent(on_wifi_event);
@@ -1243,7 +1280,27 @@ void setup() {
 
     scan_sd_for_epubs();
     clear_and_flush();
-    render_book_list();
+
+    // If the last shutdown was from sleep while reading a book, auto-resume.
+    bool resumed_from_sleep = false;
+    File lb = SD.open("/last_book.txt", FILE_READ);
+    if (lb) {
+        String last = lb.readString();
+        lb.close();
+        last.trim();
+        if (last.length() > 0) {
+            for (size_t i = 0; i < books.size(); ++i) {
+                if (last == books[i].c_str()) {
+                    selected = (int)i;
+                    Serial.printf("[WAKE] auto-opening last book: %s\n", last.c_str());
+                    open_selected();   // .pos resume happens inside
+                    resumed_from_sleep = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!resumed_from_sleep) render_book_list();
 }
 
 // returns 0/1/2/3 = none/left/center/right ; (or -1 on no touch)
@@ -1251,6 +1308,50 @@ static int classify_tap(int16_t x, int16_t y) {
     if (x < EPD_WIDTH / 4) return 1;            // left third
     if (x > 3 * EPD_WIDTH / 4) return 3;        // right third
     return 2;                                   // center
+}
+
+// Render a "sleeping" screen, persist book position if applicable, and
+// enter ESP32 deep sleep. Wake on GPIO 21 going LOW (the same button used
+// for navigation). After wake, the chip resets and setup() runs again —
+// the reader resumes from the .pos file written here.
+static void enter_deep_sleep() {
+    Serial.println("[SLEEP] entering deep sleep");
+    Serial.flush();
+
+    if (app_mode == MODE_BOOK) {
+        save_position();
+        // Persist the currently-open book filename so wake-from-sleep can
+        // re-open it directly instead of dropping into the library list.
+        File f = SD.open("/last_book.txt", FILE_WRITE);
+        if (f) {
+            f.print(books[selected].c_str());
+            f.close();
+            Serial.printf("[SLEEP] last_book = %s\n", books[selected].c_str());
+        }
+    } else {
+        // Not in a book — clear any previous marker so wake just lands in library.
+        if (SD.exists("/last_book.txt")) SD.remove("/last_book.txt");
+    }
+
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    int32_t cx = 60, cy = 200;
+    writeln((GFXfont *)&FiraSans, "Sleeping", &cx, &cy, framebuffer);
+    cx = 60; cy = 280;
+    writeln((GFXfont *)&FiraSans,
+            "Press the button to wake.", &cx, &cy, framebuffer);
+    cx = 60; cy = 340;
+    writeln((GFXfont *)&FiraSans,
+            "(Your reading position is saved.)", &cx, &cy, framebuffer);
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+
+    // Wake on BUTTON_1 (GPIO 21) pulled LOW. The pin idles HIGH via the
+    // INPUT_PULLUP we set in setup(); pressing the button drives it LOW.
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_21, 0);
+    Serial.flush();
+    esp_deep_sleep_start();   // does not return
 }
 
 // Process newline-terminated serial commands. Returns true when a command was handled.
@@ -1289,6 +1390,8 @@ static void handle_serial_commands() {
                 enter_ap_mode();
             } else if (cmd == "stop_share" || cmd == "unshare") {
                 exit_ap_mode();
+            } else if (cmd == "sleep") {
+                enter_deep_sleep();   // does not return
             } else if (cmd == "probe_buttons") {
                 Serial.println("[PROBE] press each button. Listening for 30s.");
                 const int pins[] = {0, 10, 14, 21, 38, 39, 45, 48};
@@ -1310,7 +1413,7 @@ static void handle_serial_commands() {
                 }
                 Serial.println("[PROBE] done");
             } else if (cmd == "help") {
-                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share probe_buttons help");
+                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share sleep probe_buttons help");
             } else {
                 Serial.printf("[ERR] unknown cmd: %s\n", cmd.c_str());
             }
@@ -1391,36 +1494,58 @@ void loop() {
 
     // GPIO 21 (SENSOR_VN, BUTTON_1): short press in book mode = back to library;
     //                                short press in library = cycle selection;
-    //                                long press ≥ 2 s = WiFi share mode.
+    //                                long press 2-5 s on release = WiFi share mode;
+    //                                very long press ≥ 5 s = deep sleep (immediate).
     {
         bool down = (digitalRead(BUTTON_1) == LOW);
         if (down) {
             if (button_press_start == 0) {
                 button_press_start = now;
                 button_long_handled = false;
-            } else if (!button_long_handled && now - button_press_start >= 2000) {
+            } else if (!button_long_handled && now - button_press_start >= 5000) {
+                // Hit the 5 s mark while still held → sleep, don't fall
+                // through to the 2 s AP-mode path on release.
                 button_long_handled = true;
-                Serial.println("[BTN] long press → AP mode");
-                enter_ap_mode();
-                input_cooldown_until = now + 1000;
+                Serial.println("[BTN] very-long press → deep sleep");
+                enter_deep_sleep();   // does not return
             }
         } else {
             if (button_press_start && !button_long_handled &&
                 now >= input_cooldown_until) {
-                if (app_mode == MODE_BOOK) {
+                uint32_t held = now - button_press_start;
+                if (held >= 2000) {
+                    Serial.println("[BTN] long press (released) → AP mode");
+                    enter_ap_mode();
+                    input_cooldown_until = now + 1000;
+                } else if (app_mode == MODE_BOOK) {
                     app_mode = MODE_LIBRARY;
                     render_book_list();
+                    input_cooldown_until = now + 600;
                 } else {
                     move_selection(+1);
+                    input_cooldown_until = now + 600;
                 }
-                input_cooldown_until = now + 600;
             }
             button_press_start = 0;
         }
     }
 
-    // STR_100 button (GPIO 0) shares its line with the EPD CFG_STR signal,
-    // so we cannot poll it without breaking the display. See backlog #15.
+    // STR_100 button (GPIO 0): it shares the EPD CFG_STR strobe, so we can't
+    // poll it from loop(). Instead the render functions sample it during the
+    // post-poweroff idle window and set str100_pressed. Consume it here.
+    if (str100_pressed) {
+        str100_pressed = false;
+        if (now >= input_cooldown_until) {
+            if (app_mode == MODE_BOOK) {
+                Serial.println("[STR_100] consumed → back to library");
+                app_mode = MODE_LIBRARY;
+                render_book_list();
+                input_cooldown_until = millis() + 600;
+            } else {
+                Serial.println("[STR_100] consumed in library mode (no-op)");
+            }
+        }
+    }
 
     vTaskDelay(pdMS_TO_TICKS(20));
 }

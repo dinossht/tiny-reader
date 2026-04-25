@@ -9,13 +9,16 @@ files on an SD card or upload them wirelessly from your phone/laptop.
 - Reads `.epub` files from the SD card root
 - XHTML parsing → word-wrapping → justified body text (last line of paragraph stays
   ragged, like a printed book)
-- GT911 touch nav: tap left half = previous page, tap right half = next page
-- GPIO21 button:
+- GT911 touch nav: tap left half = previous page, tap right half = next page,
+  tap top 80px = back to library
+- GPIO 21 / SENSOR_VN button:
   - **short press**: back to library / cycle selection
-  - **long press (≥ 2 s)**: open WiFi share mode
+  - **long press (≥ 2 s)**: open the hub (WiFi share mode)
 - Per-book reading position persisted to SD as `<bookname>.pos`; resumes on reopen
-- WiFi share mode: device hosts an open WiFi access point + tiny web app for
-  upload / delete / download from any phone or laptop browser
+- The **hub**: an on-demand WiFi access point + mobile-friendly web UI for
+  managing the library from any browser (upload, delete, download, jump-to-page,
+  per-device settings)
+- Configurable text density and AP idle timeout, persisted in `/settings.json`
 
 ## Hardware
 
@@ -42,19 +45,37 @@ a WiFi access point and shows the credentials on the e-paper.
 - **URL:** `http://192.168.4.1` (recommended) or `http://tiny-reader.local`
 
 The hub web UI lets you:
-- list books with current reading position
+- list books with each book's current reading position
 - upload `.epub` files from your phone or laptop
 - delete books (also removes the position sidecar)
 - download books back
 - **edit reading position per book** (jump to any chapter/page; saved to the
   `.pos` sidecar, picked up on next open)
+- **change settings**: text density (compact / medium / loose) and AP idle timeout
 
-Auto-exits after 5 min of HTTP idle, or hold the button ≥ 1.5 s to exit.
+Auto-exits after the configured idle timeout (default 5 min), or hold the
+GPIO 21 button ≥ 1.5 s to exit immediately.
 
-> Note on phones: phones often disconnect from the AP within seconds because
-> our DHCP server doesn't yet advertise itself as the DNS, so captive-portal
-> probes can't resolve and the phone decides "no internet". **Laptops work
-> fine** — use the IP, not mDNS. Phone support is on the backlog.
+### Configuration (`/settings.json`)
+
+The hub writes a small `settings.json` to the SD card root on every save:
+
+```json
+{ "density": 1, "ap_idle_minutes": 5 }
+```
+
+- `density`: `0` compact (more words per screen), `1` medium (default),
+  `2` loose (extra line spacing). Takes effect on the next book open.
+- `ap_idle_minutes`: how long the hub stays up without HTTP activity before
+  auto-shutting down. 1–120 minutes.
+
+### A note on phone clients
+
+The device runs a captive-portal-style DNS hijack so phones see "online" and
+don't auto-disconnect. If a phone still drops the connection (Linux's
+NetworkManager-style "no internet" eviction), the workaround is to navigate
+directly to `http://192.168.4.1` and ignore the warning, or temporarily
+disable the OS connectivity check while in the hub.
 
 ## Serial commands
 
