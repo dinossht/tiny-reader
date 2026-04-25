@@ -929,7 +929,11 @@ void setup() {
         Serial.println("GT911 init failed — falling back to BUTTON_1");
     }
 
-    pinMode(BUTTON_1, INPUT_PULLUP);
+    pinMode(BUTTON_1, INPUT_PULLUP);   // SENSOR_VN, GPIO 21
+    // NOTE: STR_100 button is on GPIO 0 — but GPIO 0 is also the EPD CFG_STR
+    // strobe (see ed047tc1.h: CFG_STR = GPIO_NUM_0). Configuring it as a button
+    // input fights the display driver's output mode and the screen stops
+    // refreshing. So we don't use STR_100 as a button. See backlog #15.
 
     scan_sd_for_epubs();
     clear_and_flush();
@@ -979,8 +983,28 @@ static void handle_serial_commands() {
                 enter_ap_mode();
             } else if (cmd == "stop_share" || cmd == "unshare") {
                 exit_ap_mode();
+            } else if (cmd == "probe_buttons") {
+                Serial.println("[PROBE] press each button. Listening for 30s.");
+                const int pins[] = {0, 10, 14, 21, 38, 39, 45, 48};
+                const int n = sizeof(pins)/sizeof(pins[0]);
+                for (int i = 0; i < n; ++i) pinMode(pins[i], INPUT_PULLUP);
+                bool last[16];
+                for (int i = 0; i < n; ++i) last[i] = (digitalRead(pins[i]) == LOW);
+                uint32_t end_at = millis() + 30000;
+                while (millis() < end_at) {
+                    for (int i = 0; i < n; ++i) {
+                        bool now_low = (digitalRead(pins[i]) == LOW);
+                        if (now_low != last[i]) {
+                            Serial.printf("[PROBE] GPIO %d -> %s\n",
+                                          pins[i], now_low ? "LOW (pressed)" : "HIGH (released)");
+                            last[i] = now_low;
+                        }
+                    }
+                    delay(15);
+                }
+                Serial.println("[PROBE] done");
             } else if (cmd == "help") {
-                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share help");
+                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share probe_buttons help");
             } else {
                 Serial.printf("[ERR] unknown cmd: %s\n", cmd.c_str());
             }
@@ -1055,33 +1079,38 @@ void loop() {
         }
     }
 
-    // Button1 (GPIO21): short press = back-to-library / next-selection;
-    // long press (≥ 2 s) = enter share/AP mode.
-    bool btn_down = (digitalRead(BUTTON_1) == LOW);
-    if (btn_down) {
-        if (button_press_start == 0) {
-            button_press_start = now;
-            button_long_handled = false;
-        } else if (!button_long_handled && now - button_press_start >= 2000) {
-            button_long_handled = true;
-            Serial.println("[BTN] long press → AP mode");
-            enter_ap_mode();
-            input_cooldown_until = now + 1000;
-        }
-    } else {
-        if (button_press_start && !button_long_handled &&
-            now >= input_cooldown_until) {
-            // released as a short press
-            if (app_mode == MODE_BOOK) {
-                app_mode = MODE_LIBRARY;
-                render_book_list();
-            } else {
-                move_selection(+1);
+    // GPIO 21 (SENSOR_VN, BUTTON_1): short press in book mode = back to library;
+    //                                short press in library = cycle selection;
+    //                                long press ≥ 2 s = WiFi share mode.
+    {
+        bool down = (digitalRead(BUTTON_1) == LOW);
+        if (down) {
+            if (button_press_start == 0) {
+                button_press_start = now;
+                button_long_handled = false;
+            } else if (!button_long_handled && now - button_press_start >= 2000) {
+                button_long_handled = true;
+                Serial.println("[BTN] long press → AP mode");
+                enter_ap_mode();
+                input_cooldown_until = now + 1000;
             }
-            input_cooldown_until = now + 600;
+        } else {
+            if (button_press_start && !button_long_handled &&
+                now >= input_cooldown_until) {
+                if (app_mode == MODE_BOOK) {
+                    app_mode = MODE_LIBRARY;
+                    render_book_list();
+                } else {
+                    move_selection(+1);
+                }
+                input_cooldown_until = now + 600;
+            }
+            button_press_start = 0;
         }
-        button_press_start = 0;
     }
+
+    // STR_100 button (GPIO 0) shares its line with the EPD CFG_STR signal,
+    // so we cannot poll it without breaking the display. See backlog #15.
 
     vTaskDelay(pdMS_TO_TICKS(20));
 }
