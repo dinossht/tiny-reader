@@ -767,7 +767,8 @@ static void render_ap_screen() {
 
 static const char AP_INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html>
-<html><head><meta name=viewport content="width=device-width,initial-scale=1"/>
+<html><head><meta charset="UTF-8"/>
+<meta name=viewport content="width=device-width,initial-scale=1"/>
 <title>tiny-reader</title>
 <style>
 body{font-family:-apple-system,sans-serif;max-width:640px;margin:0 auto;padding:1em;}
@@ -880,16 +881,23 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
  };
  var saveSettings=function(e){
   e.preventDefault();
+  var st=document.getElementById('settings_status');
   var fd=new URLSearchParams();
   fd.append('density',document.getElementById('density').value);
   fd.append('ap_idle_minutes',document.getElementById('apidle').value);
-  document.getElementById('settings_status').textContent='saving...';
+  st.textContent='saving...';
   fetch('/api/settings',{method:'POST',body:fd,
         headers:{'Content-Type':'application/x-www-form-urlencoded'}})
-   .then(function(r){return r.json();})
+   .then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+   })
    .then(function(j){
-    document.getElementById('settings_status').textContent=
-      j.changed? 'saved (book layout updates on next open)' : 'no changes';
+    st.textContent=j.changed? 'saved (applies on next book open)'
+                            : 'saved (no changes)';
+   })
+   .catch(function(err){
+    st.textContent='save failed: '+err.message;
    });
  };
  load();
@@ -900,10 +908,13 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 // Async handlers below take AsyncWebServerRequest *req.
 static void ap_handle_root(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    req->send_P(200, "text/html", AP_INDEX_HTML);
+    AsyncWebServerResponse *r = req->beginResponse_P(200, "text/html; charset=utf-8", AP_INDEX_HTML);
+    req->send(r);
 }
 static void ap_handle_settings_get(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
+    Serial.printf("[HTTP] GET /api/settings (density=%d ap_idle=%d)\n",
+                  g_settings.density, g_settings.ap_idle_minutes);
     char buf[96];
     snprintf(buf, sizeof(buf),
              "{\"density\":%d,\"ap_idle_minutes\":%d}",
@@ -913,6 +924,12 @@ static void ap_handle_settings_get(AsyncWebServerRequest *req) {
 
 static void ap_handle_settings_post(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
+    Serial.printf("[HTTP] POST /api/settings — params: %d\n", req->params());
+    for (size_t i = 0; i < req->params(); ++i) {
+        const AsyncWebParameter *p = req->getParam(i);
+        Serial.printf("  - %s = %s (post=%d)\n",
+                      p->name().c_str(), p->value().c_str(), p->isPost());
+    }
     bool changed = false;
     if (req->hasParam("density", true)) {
         int d = req->getParam("density", true)->value().toInt();
@@ -931,7 +948,6 @@ static void ap_handle_settings_post(AsyncWebServerRequest *req) {
     if (changed) {
         save_settings();
         apply_density();
-        // a new ap_idle_minutes value also takes effect on the *next* AP session.
     }
     req->send(200, "application/json", changed ? "{\"ok\":true,\"changed\":true}"
                                                 : "{\"ok\":true,\"changed\":false}");
