@@ -1660,11 +1660,9 @@ static void ap_handle_chunk_done(AsyncWebServerRequest *req) {
     size_t wrote = (g_chunk_used > 0) ? f.write(g_chunk_buf, g_chunk_used) : 0;
     f.flush();
     f.close();
-    Serial.printf("[CHUNK] %s @%u +%u%s heap=%u psram=%u\n", path.c_str(),
+    Serial.printf("[CHUNK] %s @%u +%u%s\n", path.c_str(),
                   (unsigned)offset, (unsigned)wrote,
-                  is_final ? " (final)" : "",
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)ESP.getFreePsram());
+                  is_final ? " (final)" : "");
     Serial.flush();
 
     // Keep-alive: do NOT force Connection: close. Closing per chunk burns
