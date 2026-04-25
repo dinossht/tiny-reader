@@ -66,7 +66,7 @@ static int total_spine = 0;
 static int current_page_in_chapter = 0;
 static std::vector<std::string> chapter_pages;  // each entry = one page of \n-separated lines
 static const int BOOK_MARGIN_X = 50;
-static const int BOOK_TOP_RESERVE = 70;     // header strip with book title + small gap
+static const int BOOK_TOP_RESERVE = 30;     // small visual margin only
 static const int BOOK_FOOTER_RESERVE = 50;
 // Layout values that depend on the user's "density" setting (see g_settings).
 // FiraSans advance_y is 50 — line_height < 50 would overlap glyphs.
@@ -102,9 +102,11 @@ static bool sample_str100_button() {
 
 static void apply_density() {
     switch (g_settings.density) {
-        case 0:  // compact — same line height (font is bitmap), more chars/line
+        case 0:  // compact — same line height, slightly more chars per line.
+                 // 48 chars stays inside 860px body width on FiraSans (52
+                 // overflowed on long lines).
             book_line_height = 50;
-            book_chars_per_line = 52;
+            book_chars_per_line = 48;
             break;
         case 2:  // loose — extra leading between lines, fewer chars per line
             book_line_height = 60;
@@ -570,21 +572,8 @@ static void render_book_page() {
     dump_current_page_to_serial();
 
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
-
-    // Header strip — book title at top. The top 80px is also the
-    // tap-back-to-library zone, which now has visible content.
-    {
-        std::string title = short_title_for_selected();
-        if (title.size() > 56) title = title.substr(0, 53) + "...";
-        int32_t hx = BOOK_MARGIN_X, hy = 40;
-        writeln((GFXfont *)&FiraSans, title.c_str(), &hx, &hy, framebuffer);
-        // Thin underline divider at y = 60 to delimit header from body.
-        for (int x = BOOK_MARGIN_X; x < EPD_WIDTH - BOOK_MARGIN_X; ++x) {
-            int idx = (60 * EPD_WIDTH + x) / 2;
-            framebuffer[idx] &= (x & 1) ? 0x0F : 0xF0;
-        }
-    }
-
+    // (no header strip — body uses the full vertical space; the top 80px is
+    // still the tap-back-to-library zone, just invisibly so.)
     int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
@@ -726,11 +715,16 @@ static void render_book_list() {
         }
     }
 
-    // footer: tap zones legend
+    // footer: tap zones legend on two short lines so it fits the wide bitmap font.
     cx = LIST_X;
-    cy = EPD_HEIGHT - 30;
+    cy = EPD_HEIGHT - 70;
     writeln((GFXfont *)&FiraSans,
-            "tap left/right = navigate   tap center = open   hold button 2s = WiFi   5s = sleep",
+            "tap left/right = navigate    tap center = open",
+            &cx, &cy, framebuffer);
+    cx = LIST_X;
+    cy = EPD_HEIGHT - 20;
+    writeln((GFXfont *)&FiraSans,
+            "hold button: 2s = WiFi share    5s = sleep",
             &cx, &cy, framebuffer);
 
     epd_poweron();
