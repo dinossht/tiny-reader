@@ -353,13 +353,23 @@ static std::string strip_xhtml(const char *src, size_t len) {
     return decode_entities(out2);
 }
 
-// Greedy word-wrap to ~book_chars_per_line per line; preserve paragraph breaks.
+// Pixel-width word wrap — measures actual rendered width with the body font
+// so wide chars like M/W don't push lines past the right edge. Preserves
+// paragraph breaks (consecutive \n becomes a blank line in the output).
 static std::vector<std::string> wrap_text(const std::string &text) {
     std::vector<std::string> lines;
+    const int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
+    const GFXfont *font = (const GFXfont *)&FiraSans;
+
+    auto measure = [font](const char *s) -> int {
+        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+        get_text_bounds(font, s, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        return (int)mw;
+    };
+
     std::string para;
     for (size_t i = 0; i <= text.size(); ++i) {
         if (i == text.size() || text[i] == '\n') {
-            // wrap one paragraph
             std::string current;
             std::string word;
             for (size_t j = 0; j <= para.size(); ++j) {
@@ -368,12 +378,14 @@ static std::vector<std::string> wrap_text(const std::string &text) {
                     if (!word.empty()) {
                         if (current.empty()) {
                             current = word;
-                        } else if ((int)(current.size() + 1 + word.size()) <= book_chars_per_line) {
-                            current += ' ';
-                            current += word;
                         } else {
-                            lines.push_back(current);
-                            current = word;
+                            std::string candidate = current + " " + word;
+                            if (measure(candidate.c_str()) <= target_w) {
+                                current = std::move(candidate);
+                            } else {
+                                lines.push_back(current);
+                                current = word;
+                            }
                         }
                         word.clear();
                     }
@@ -382,8 +394,7 @@ static std::vector<std::string> wrap_text(const std::string &text) {
                 }
             }
             if (!current.empty()) lines.push_back(current);
-            // blank line between paragraphs
-            if (i < text.size()) lines.push_back("");
+            if (i < text.size()) lines.push_back("");   // paragraph separator
             para.clear();
         } else {
             para.push_back(text[i]);
