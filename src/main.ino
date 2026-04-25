@@ -42,6 +42,7 @@
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
@@ -177,6 +178,61 @@ static bool save_settings() {
     f.close();
     Serial.printf("[SETTINGS] saved: density=%d ap_idle_minutes=%d\n",
                   g_settings.density, g_settings.ap_idle_minutes);
+    return true;
+}
+
+// ---- TODO list (backlog #11): hub-managed notes/todo persisted on SD. ----
+// Schema on disk (/todos.json):
+//   {"items":[{"text":"buy milk","done":false}, ...]}
+// Caps: TODOS_MAX_ITEMS items, TODOS_MAX_TEXT bytes per item.
+struct TodoItem { std::string text; bool done; };
+static std::vector<TodoItem> g_todos;
+static const size_t TODOS_MAX_ITEMS = 50;
+static const size_t TODOS_MAX_TEXT  = 200;
+
+static void load_todos() {
+    g_todos.clear();
+    File f = SD.open("/todos.json", FILE_READ);
+    if (!f) {
+        Serial.println("[TODOS] no /todos.json — starting empty");
+        return;
+    }
+    // ArduinoJson v7 uses elastic JsonDocument; size to file length + slack.
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) {
+        Serial.printf("[TODOS] parse failed: %s — starting empty\n", err.c_str());
+        return;
+    }
+    JsonArrayConst items = doc["items"].as<JsonArrayConst>();
+    for (JsonVariantConst v : items) {
+        if (g_todos.size() >= TODOS_MAX_ITEMS) break;
+        const char *t = v["text"] | "";
+        bool d = v["done"] | false;
+        if (!t || !*t) continue;
+        TodoItem it;
+        it.text.assign(t, strnlen(t, TODOS_MAX_TEXT));
+        it.done = d;
+        g_todos.push_back(std::move(it));
+    }
+    Serial.printf("[TODOS] loaded %u item(s)\n", (unsigned)g_todos.size());
+}
+
+static bool save_todos() {
+    JsonDocument doc;
+    JsonArray items = doc["items"].to<JsonArray>();
+    for (const TodoItem &it : g_todos) {
+        JsonObject o = items.add<JsonObject>();
+        o["text"] = it.text;
+        o["done"] = it.done;
+    }
+    File f = SD.open("/todos.json", FILE_WRITE);
+    if (!f) { Serial.println("[TODOS] save failed"); return false; }
+    size_t n = serializeJson(doc, f);
+    f.close();
+    Serial.printf("[TODOS] saved %u item(s), %u bytes\n",
+                  (unsigned)g_todos.size(), (unsigned)n);
     return true;
 }
 
@@ -936,6 +992,15 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 <button>save settings</button>
 <div id=settings_status class=muted></div>
 </form>
+<form id=tf onsubmit="addTodo(event)">
+<h3>todo</h3>
+<div id=todos class=muted>loading...</div>
+<div style="display:flex;gap:.4em;margin-top:.6em;">
+ <input type=text id=todo_text maxlength=200 placeholder="new item" style="flex:1;font-size:1em;padding:.3em" required/>
+ <button>add</button>
+</div>
+<div id=todo_status class=muted></div>
+</form>
 <script>
  var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
  var jsq=function(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");};
@@ -1025,8 +1090,68 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
     st.textContent='save failed: '+err.message;
    });
  };
+ var todoState=[];
+ var renderTodos=function(){
+  var d=document.getElementById('todos');
+  if(!todoState.length){d.innerHTML='<p class=muted>(empty)</p>';return;}
+  d.innerHTML=todoState.map(function(it,i){
+   var checked=it.done?' checked':'';
+   return '<div class=book>'+
+    '<div class=book-row>'+
+     '<input type=checkbox data-i='+i+' onchange="toggleTodo('+i+')"'+checked+'/>'+
+     '<span class=book-name'+(it.done?' style="text-decoration:line-through;color:#888"':'')+'>'+esc(it.text)+'</span>'+
+     '<button class=btn-link onclick="delTodo('+i+')">delete</button>'+
+    '</div>'+
+   '</div>';
+  }).join('');
+ };
+ var loadTodos=function(){
+  fetch('/api/todos').then(function(r){return r.json();}).then(function(j){
+   todoState=(j&&j.items)?j.items:[];
+   renderTodos();
+  });
+ };
+ var saveTodos=function(){
+  var st=document.getElementById('todo_status');
+  var fd=new URLSearchParams();
+  fd.append('items',JSON.stringify(todoState));
+  st.textContent='saving...';
+  fetch('/api/todos',{method:'POST',body:fd,
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){
+    if(!r.ok) return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});
+    return r.json();
+   })
+   .then(function(){st.textContent='saved';})
+   .catch(function(err){st.textContent='save failed: '+err.message;loadTodos();});
+ };
+ var addTodo=function(e){
+  e.preventDefault();
+  var input=document.getElementById('todo_text');
+  var t=(input.value||'').trim();
+  if(!t) return;
+  if(t.length>200){document.getElementById('todo_status').textContent='item too long (max 200 chars)';return;}
+  if(todoState.length>=50){document.getElementById('todo_status').textContent='max 50 items';return;}
+  todoState.push({text:t,done:false});
+  input.value='';
+  renderTodos();
+  saveTodos();
+ };
+ var toggleTodo=function(i){
+  if(i<0||i>=todoState.length) return;
+  todoState[i].done=!todoState[i].done;
+  renderTodos();
+  saveTodos();
+ };
+ var delTodo=function(i){
+  if(i<0||i>=todoState.length) return;
+  todoState.splice(i,1);
+  renderTodos();
+  saveTodos();
+ };
  load();
  loadSettings();
+ loadTodos();
 </script></body></html>
 )HTML";
 
@@ -1080,6 +1205,86 @@ static void ap_handle_settings_post(AsyncWebServerRequest *req) {
     }
     req->send(200, "application/json", changed ? "{\"ok\":true,\"changed\":true}"
                                                 : "{\"ok\":true,\"changed\":false}");
+}
+
+static void ap_handle_todos_get(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    Serial.printf("[HTTP] GET /api/todos (n=%u)\n", (unsigned)g_todos.size());
+    JsonDocument doc;
+    JsonArray items = doc["items"].to<JsonArray>();
+    for (const TodoItem &it : g_todos) {
+        JsonObject o = items.add<JsonObject>();
+        o["text"] = it.text;
+        o["done"] = it.done;
+    }
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+static void ap_handle_todos_post(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    Serial.printf("[HTTP] POST /api/todos — params: %d\n", req->params());
+    if (!req->hasParam("items", true)) {
+        req->send(400, "application/json",
+                  "{\"error\":\"missing items field\"}");
+        return;
+    }
+    String raw = req->getParam("items", true)->value();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, raw);
+    if (err) {
+        Serial.printf("[TODOS] POST parse failed: %s\n", err.c_str());
+        req->send(400, "application/json",
+                  "{\"error\":\"invalid json\"}");
+        return;
+    }
+    if (!doc.is<JsonArray>()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"items must be a JSON array\"}");
+        return;
+    }
+    JsonArrayConst arr = doc.as<JsonArrayConst>();
+    if (arr.size() > TODOS_MAX_ITEMS) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "{\"error\":\"too many items (max %u)\"}",
+                 (unsigned)TODOS_MAX_ITEMS);
+        req->send(400, "application/json", buf);
+        return;
+    }
+    std::vector<TodoItem> next;
+    next.reserve(arr.size());
+    for (JsonVariantConst v : arr) {
+        const char *t = v["text"] | "";
+        bool d = v["done"] | false;
+        if (!t) t = "";
+        size_t tlen = strlen(t);
+        if (tlen > TODOS_MAX_TEXT) {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "{\"error\":\"item too long (max %u chars)\"}",
+                     (unsigned)TODOS_MAX_TEXT);
+            req->send(400, "application/json", buf);
+            return;
+        }
+        if (tlen == 0) continue;   // skip blanks silently
+        TodoItem it;
+        it.text.assign(t, tlen);
+        it.done = d;
+        next.push_back(std::move(it));
+    }
+    g_todos.swap(next);
+    bool ok = save_todos();
+    if (!ok) {
+        req->send(500, "application/json",
+                  "{\"error\":\"save failed\"}");
+        return;
+    }
+    char buf[48];
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"count\":%u}",
+             (unsigned)g_todos.size());
+    req->send(200, "application/json", buf);
 }
 
 static void ap_handle_books_json(AsyncWebServerRequest *req) {
@@ -1241,6 +1446,8 @@ static void enter_ap_mode() {
     web_server->on("/api/books", HTTP_GET, ap_handle_books_json);
     web_server->on("/api/settings", HTTP_GET, ap_handle_settings_get);
     web_server->on("/api/settings", HTTP_POST, ap_handle_settings_post);
+    web_server->on("/api/todos", HTTP_GET, ap_handle_todos_get);
+    web_server->on("/api/todos", HTTP_POST, ap_handle_todos_post);
     web_server->on("/ping", HTTP_GET, [](AsyncWebServerRequest *r) {
         Serial.println("[HTTP] GET /ping");
         r->send(200, "text/plain", "pong");
@@ -1371,6 +1578,7 @@ void setup() {
 
     load_settings();
     apply_density();
+    load_todos();
 
     scan_sd_for_epubs();
     clear_and_flush();

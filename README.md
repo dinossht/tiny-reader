@@ -14,7 +14,13 @@ files on an SD card or upload them wirelessly from your phone/laptop.
 - GPIO 21 / SENSOR_VN button:
   - **short press**: back to library / cycle selection
   - **long press (≥ 2 s)**: open the hub (WiFi share mode)
+  - **long-long press (≥ 5 s)**: deep sleep (auto-resumes the same book on wake)
+- STR_100 (GPIO 0) button: post-render sample → press = back to library when
+  reading. Limited to one sample per page render because GPIO 0 is shared
+  with the EPD CFG_STR strobe.
 - Per-book reading position persisted to SD as `<bookname>.pos`; resumes on reopen
+- Last-open book stored in NVS so deep sleep + wake brings you back to the
+  exact page you were on
 - The **hub**: an on-demand WiFi access point + mobile-friendly web UI for
   managing the library from any browser (upload, delete, download, jump-to-page,
   per-device settings)
@@ -52,6 +58,7 @@ The hub web UI lets you:
 - **edit reading position per book** (jump to any chapter/page; saved to the
   `.pos` sidecar, picked up on next open)
 - **change settings**: text density (compact / medium / loose) and AP idle timeout
+- **maintain a TODO list** (persisted on SD as `/todos.json`, max 50 items)
 
 Auto-exits after the configured idle timeout (default 5 min), or hold the
 GPIO 21 button ≥ 1.5 s to exit immediately.
