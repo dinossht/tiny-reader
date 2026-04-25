@@ -18,6 +18,7 @@
   printf("\n");
 #endif
 #include <map>
+#include <cstring>
 #include "tinyxml2.h"
 #include "ZipFile.h"
 #include "Epub.h"
@@ -141,10 +142,16 @@ bool Epub::parse_content_opf(ZipFile &zip, std::string &content_opf_file)
     {
       m_cover_image_item = href;
     }
-    // grab the ncx file
+    // grab the ncx file (EPUB 2)
     if (item_id == "ncx")
     {
       m_toc_ncx_item = href;
+    }
+    // grab the nav doc (EPUB 3 — item declared with properties="nav")
+    const char *props = item->Attribute("properties");
+    if (props && strstr(props, "nav") != nullptr)
+    {
+      m_toc_nav_item = href;
     }
     items[item_id] = href;
     item = item->NextSiblingElement("item");
@@ -235,6 +242,78 @@ bool Epub::parse_toc_ncx_file(ZipFile &zip)
   return true;
 }
 
+// Parse an EPUB 3 nav doc (XHTML with <nav epub:type="toc"> ... <ol><li><a/>).
+// Falls back here when no NCX is declared, OR when the file declared with
+// id="ncx" is actually XHTML (Project Gutenberg does this — the "ncx" item
+// points at toc.xhtml).
+bool Epub::parse_toc_nav_file(ZipFile &zip)
+{
+  std::string nav_path = !m_toc_nav_item.empty() ? m_toc_nav_item
+                                                 : m_toc_ncx_item;
+  if (nav_path.empty()) return false;
+  ESP_LOGI(TAG, "nav path: %s\n", nav_path.c_str());
+
+  char *nav_data = (char *)zip.read_file_to_memory(nav_path.c_str());
+  if (!nav_data)
+  {
+    ESP_LOGE(TAG, "Could not find %s", nav_path.c_str());
+    return false;
+  }
+  tinyxml2::XMLDocument doc;
+  auto result = doc.Parse(nav_data);
+  free(nav_data);
+  if (result != tinyxml2::XML_SUCCESS)
+  {
+    ESP_LOGE(TAG, "Error parsing nav doc %s", doc.ErrorIDToName(result));
+    return false;
+  }
+
+  // Find <nav epub:type="toc"> by walking <html><body> looking for any nav.
+  tinyxml2::XMLElement *toc_nav = nullptr;
+  auto html = doc.FirstChildElement("html");
+  auto body = html ? html->FirstChildElement("body") : nullptr;
+  if (!body) return false;
+  for (auto nav = body->FirstChildElement("nav"); nav && !toc_nav;
+       nav = nav->NextSiblingElement("nav"))
+  {
+    const char *t = nav->Attribute("epub:type");
+    // first <nav> is fine if no epub:type tags exist; prefer epub:type="toc".
+    if (!t || (t && strstr(t, "toc"))) toc_nav = nav;
+  }
+  if (!toc_nav) return false;
+
+  auto ol = toc_nav->FirstChildElement("ol");
+  if (!ol) return false;
+  for (auto li = ol->FirstChildElement("li"); li;
+       li = li->NextSiblingElement("li"))
+  {
+    auto a = li->FirstChildElement("a");
+    if (!a) continue;
+    const char *src = a->Attribute("href");
+    if (!src) continue;
+    // Title: walk children; accept direct text or text wrapped in
+    // inline elements like <span>Title</span>.
+    std::string title;
+    for (auto n = a->FirstChild(); n; n = n->NextSibling())
+    {
+      if (n->ToText() && n->Value()) title += n->Value();
+      else if (n->ToElement() && n->FirstChild() && n->FirstChild()->ToText()
+               && n->FirstChild()->Value())
+        title += n->FirstChild()->Value();
+    }
+    std::string href = m_base_path + src;
+    size_t pos = href.find('#');
+    std::string anchor = "";
+    if (pos != std::string::npos)
+    {
+      anchor = href.substr(pos + 1);
+      href = href.substr(0, pos);
+    }
+    m_toc.push_back(EpubTocEntry(title, href, anchor, 0));
+  }
+  return !m_toc.empty();
+}
+
 Epub::Epub(const std::string &path) : m_path(path)
 {
 }
@@ -262,9 +341,11 @@ bool Epub::load()
   {
     return false;
   }
-  if (!parse_toc_ncx_file(zip))
+  // Try EPUB 2 NCX first; fall back to EPUB 3 nav doc; if both fail, the
+  // book still loads — chapter labels just become spine indices.
+  if (!parse_toc_ncx_file(zip) && !parse_toc_nav_file(zip))
   {
-    return false;
+    ESP_LOGW(TAG, "no usable TOC — book will load without chapter labels");
   }
   return true;
 }
