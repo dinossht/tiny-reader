@@ -1,0 +1,11 @@
+{
+  "name": "lilygo_epd47_s3",
+  "version": "1.0.0",
+  "description": "Vendored from Xinyuan-LilyGO/LilyGo-EPD47 (esp32s3 branch). Display driver + bundled fonts + pin/utility headers for the LilyGo T5 4.7\" V2.3 board.",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src"
+  }
+}
