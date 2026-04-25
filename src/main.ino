@@ -815,11 +815,7 @@ static void render_book_end() {
         writeln((GFXfont *)&FiraSans, info, &cx, &cy, framebuffer);
     }
 
-    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
-    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
-    writeln((GFXfont *)&firasans_small,
-            "tap left = re-read last page    tap anywhere else = library",
-            &fx, &fy, framebuffer);
+    // (no footer hints on the end screen — feels nicer to land on)
 
     epd_poweron();
     epd_clear();
@@ -931,18 +927,7 @@ static void render_book_list() {
         }
     }
 
-    // footer: tap zones legend in the smaller font, with a divider above.
-    draw_hline(EPD_HEIGHT - 80, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
-    cx = LIST_X;
-    cy = EPD_HEIGHT - 50;
-    writeln((GFXfont *)&firasans_small,
-            "tap left/right = navigate   tap center = open   tap bottom-right = TODO",
-            &cx, &cy, framebuffer);
-    cx = LIST_X;
-    cy = EPD_HEIGHT - 12;
-    writeln((GFXfont *)&firasans_small,
-            "hold button:  2s = WiFi share    5s = sleep",
-            &cx, &cy, framebuffer);
+    // (footer hints intentionally removed — clean library look)
 
     epd_poweron();
     epd_clear();
@@ -1024,12 +1009,7 @@ static void render_chapter_jump() {
         }
     }
 
-    // Footer hint
-    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
-    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
-    writeln((GFXfont *)&firasans_small,
-            "tap a row to jump   -   tap top-left/right to page   -   tap top-center to cancel",
-            &fx, &fy, framebuffer);
+    // (footer hints intentionally removed)
 
     epd_poweron();
     epd_clear();
@@ -1107,13 +1087,6 @@ static void render_todo_list() {
             writeln((GFXfont *)&FiraSans, more, &cx, &cy, framebuffer);
         }
     }
-
-    // Footer: divider + small hint
-    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
-    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
-    writeln((GFXfont *)&firasans_small,
-            "tap a row = toggle done    tap top or bottom-right = library    button = same",
-            &fx, &fy, framebuffer);
 
     epd_poweron();
     epd_clear();
