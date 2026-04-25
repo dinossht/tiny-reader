@@ -36,6 +36,8 @@
 #include <ESPmDNS.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
+#include <esp_netif.h>
+#include <lwip/ip4_addr.h>
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
@@ -61,12 +63,43 @@ static int total_spine = 0;
 static int current_page_in_chapter = 0;
 static std::vector<std::string> chapter_pages;  // each entry = one page of \n-separated lines
 static const int BOOK_MARGIN_X = 50;
-static const int BOOK_LINE_HEIGHT = 50;     // FiraSans advance_y per firasans.h
 static const int BOOK_TOP_RESERVE = 30;     // small visual margin only
 static const int BOOK_FOOTER_RESERVE = 50;
-static const int BOOK_LINES_PER_PAGE =
-    (EPD_HEIGHT - BOOK_TOP_RESERVE - BOOK_FOOTER_RESERVE) / BOOK_LINE_HEIGHT;  // ~9
-static const int BOOK_CHARS_PER_LINE = 44;  // FiraSans is variable-width; conservative limit
+// Layout values that depend on the user's "density" setting (see g_settings).
+// FiraSans advance_y is 50 — line_height < 50 would overlap glyphs.
+static int book_line_height = 50;
+static int book_lines_per_page = 9;
+static int book_chars_per_line = 44;
+
+// User-editable settings persisted to /settings.json on SD.
+static struct Settings {
+    int density;           // 0=compact, 1=medium (default), 2=loose
+    int ap_idle_minutes;   // default 5
+} g_settings = { 1, 5 };
+
+static void apply_density() {
+    switch (g_settings.density) {
+        case 0:  // compact — same line height (font is bitmap), more chars/line
+            book_line_height = 50;
+            book_chars_per_line = 52;
+            break;
+        case 2:  // loose — extra leading between lines, fewer chars per line
+            book_line_height = 60;
+            book_chars_per_line = 36;
+            break;
+        case 1:  // medium (default)
+        default:
+            g_settings.density = 1;
+            book_line_height = 50;
+            book_chars_per_line = 44;
+            break;
+    }
+    book_lines_per_page =
+        (EPD_HEIGHT - BOOK_TOP_RESERVE - BOOK_FOOTER_RESERVE) / book_line_height;
+    Serial.printf("[SETTINGS] density=%d -> line_h=%d lines/page=%d chars/line=%d\n",
+                  g_settings.density, book_line_height,
+                  book_lines_per_page, book_chars_per_line);
+}
 
 // ---- helpers ----
 
@@ -83,6 +116,42 @@ static int read_battery_percent() {
     if (v >= 4.20f) return 100;
     if (v <= 3.30f) return 0;
     return (int)((v - 3.30f) / 0.90f * 100.0f + 0.5f);
+}
+
+// Load g_settings from /settings.json on SD; falls back to defaults if missing.
+static void load_settings() {
+    File f = SD.open("/settings.json", FILE_READ);
+    if (!f) {
+        Serial.println("[SETTINGS] no /settings.json — using defaults");
+        return;
+    }
+    String s = f.readString();
+    f.close();
+    int d_i = s.indexOf("\"density\"");
+    int t_i = s.indexOf("\"ap_idle_minutes\"");
+    if (d_i >= 0) {
+        int colon = s.indexOf(':', d_i);
+        if (colon >= 0) g_settings.density = s.substring(colon + 1).toInt();
+    }
+    if (t_i >= 0) {
+        int colon = s.indexOf(':', t_i);
+        if (colon >= 0) g_settings.ap_idle_minutes = s.substring(colon + 1).toInt();
+    }
+    if (g_settings.density < 0 || g_settings.density > 2) g_settings.density = 1;
+    if (g_settings.ap_idle_minutes < 1) g_settings.ap_idle_minutes = 5;
+    Serial.printf("[SETTINGS] loaded: density=%d ap_idle_minutes=%d\n",
+                  g_settings.density, g_settings.ap_idle_minutes);
+}
+
+static bool save_settings() {
+    File f = SD.open("/settings.json", FILE_WRITE);
+    if (!f) { Serial.println("[SETTINGS] save failed"); return false; }
+    f.printf("{\"density\":%d,\"ap_idle_minutes\":%d}\n",
+             g_settings.density, g_settings.ap_idle_minutes);
+    f.close();
+    Serial.printf("[SETTINGS] saved: density=%d ap_idle_minutes=%d\n",
+                  g_settings.density, g_settings.ap_idle_minutes);
+    return true;
 }
 
 static void clear_and_flush() {
@@ -202,7 +271,7 @@ static std::string strip_xhtml(const char *src, size_t len) {
     return decode_entities(out2);
 }
 
-// Greedy word-wrap to ~BOOK_CHARS_PER_LINE per line; preserve paragraph breaks.
+// Greedy word-wrap to ~book_chars_per_line per line; preserve paragraph breaks.
 static std::vector<std::string> wrap_text(const std::string &text) {
     std::vector<std::string> lines;
     std::string para;
@@ -217,7 +286,7 @@ static std::vector<std::string> wrap_text(const std::string &text) {
                     if (!word.empty()) {
                         if (current.empty()) {
                             current = word;
-                        } else if ((int)(current.size() + 1 + word.size()) <= BOOK_CHARS_PER_LINE) {
+                        } else if ((int)(current.size() + 1 + word.size()) <= book_chars_per_line) {
                             current += ' ';
                             current += word;
                         } else {
@@ -247,7 +316,7 @@ static std::vector<std::string> paginate_lines(const std::vector<std::string> &l
     std::string page;
     int n_in_page = 0;
     for (const auto &line : lines) {
-        if (n_in_page >= BOOK_LINES_PER_PAGE) {
+        if (n_in_page >= book_lines_per_page) {
             pages.push_back(page);
             page.clear();
             n_in_page = 0;
@@ -457,7 +526,7 @@ static void render_book_page_text(int x_start, int target_w, int32_t y0, uint8_t
             render_line((GFXfont *)&FiraSans, line.c_str(),
                         x_start, target_w, cy, fb, !last_of_para);
         }
-        cy += BOOK_LINE_HEIGHT;
+        cy += book_line_height;
     }
 }
 
@@ -621,7 +690,8 @@ static bool ap_active = false;
 static String ap_ssid;
 static String ap_password;
 static uint32_t ap_last_activity = 0;
-static const uint32_t AP_IDLE_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 min
+// Computed at AP entry from g_settings.ap_idle_minutes.
+static uint32_t ap_idle_timeout_ms = 5UL * 60UL * 1000UL;
 static File ap_upload_file;
 
 static const char *AP_SSID_FIXED = "tiny-reader";
@@ -722,6 +792,24 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 <button>upload</button>
 <div id=status class=muted></div>
 </form>
+<form id=sf onsubmit="saveSettings(event)">
+<h3>settings</h3>
+<label>text density
+ <select name=density id=density>
+  <option value=0>compact (more text per page)</option>
+  <option value=1>medium (default)</option>
+  <option value=2>loose (more breathing room)</option>
+ </select>
+</label>
+<br><br>
+<label>WiFi share auto-exit after
+ <input type=number name=ap_idle_minutes id=apidle min=1 max=120 step=1 style="width:5em">
+ minutes idle
+</label>
+<br><br>
+<button>save settings</button>
+<div id=settings_status class=muted></div>
+</form>
 <script>
  var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
  var jsq=function(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");};
@@ -784,7 +872,28 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
    if(r.ok) load(); else alert('delete failed');
   });
  };
+ var loadSettings=function(){
+  fetch('/api/settings').then(function(r){return r.json();}).then(function(s){
+   document.getElementById('density').value=s.density;
+   document.getElementById('apidle').value=s.ap_idle_minutes;
+  });
+ };
+ var saveSettings=function(e){
+  e.preventDefault();
+  var fd=new URLSearchParams();
+  fd.append('density',document.getElementById('density').value);
+  fd.append('ap_idle_minutes',document.getElementById('apidle').value);
+  document.getElementById('settings_status').textContent='saving...';
+  fetch('/api/settings',{method:'POST',body:fd,
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){return r.json();})
+   .then(function(j){
+    document.getElementById('settings_status').textContent=
+      j.changed? 'saved (book layout updates on next open)' : 'no changes';
+   });
+ };
  load();
+ loadSettings();
 </script></body></html>
 )HTML";
 
@@ -793,6 +902,41 @@ static void ap_handle_root(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
     req->send_P(200, "text/html", AP_INDEX_HTML);
 }
+static void ap_handle_settings_get(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "{\"density\":%d,\"ap_idle_minutes\":%d}",
+             g_settings.density, g_settings.ap_idle_minutes);
+    req->send(200, "application/json", buf);
+}
+
+static void ap_handle_settings_post(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    bool changed = false;
+    if (req->hasParam("density", true)) {
+        int d = req->getParam("density", true)->value().toInt();
+        if (d >= 0 && d <= 2 && d != g_settings.density) {
+            g_settings.density = d;
+            changed = true;
+        }
+    }
+    if (req->hasParam("ap_idle_minutes", true)) {
+        int m = req->getParam("ap_idle_minutes", true)->value().toInt();
+        if (m >= 1 && m <= 120 && m != g_settings.ap_idle_minutes) {
+            g_settings.ap_idle_minutes = m;
+            changed = true;
+        }
+    }
+    if (changed) {
+        save_settings();
+        apply_density();
+        // a new ap_idle_minutes value also takes effect on the *next* AP session.
+    }
+    req->send(200, "application/json", changed ? "{\"ok\":true,\"changed\":true}"
+                                                : "{\"ok\":true,\"changed\":false}");
+}
+
 static void ap_handle_books_json(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
     String json = ap_build_books_json();
@@ -914,6 +1058,28 @@ static void enter_ap_mode() {
     WiFi.setSleep(false);   // keep radio on; AP power-save drops connections.
     delay(200);
 
+    // DHCP-DNS hijack: tell connecting phones to use 192.168.4.1 as their DNS.
+    // Without this, phones resolve connectivitycheck.gstatic.com via cellular
+    // DNS, fail (no internet path), declare "no internet" and drop the link.
+    // Have to stop dhcps, set option + DNS, then restart.
+    {
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif) {
+            esp_netif_dns_info_t dns_info = {};
+            IP_ADDR4(&dns_info.ip, 192, 168, 4, 1);
+            esp_netif_dhcps_stop(ap_netif);
+            uint8_t opt_val = 1;  // OFFER_DNS = 1
+            esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                                   ESP_NETIF_DOMAIN_NAME_SERVER,
+                                   &opt_val, sizeof(opt_val));
+            esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+            esp_netif_dhcps_start(ap_netif);
+            Serial.println("[AP] DHCP advertising 192.168.4.1 as DNS");
+        } else {
+            Serial.println("[AP] WIFI_AP_DEF netif not found; DHCP-DNS skip");
+        }
+    }
+
     IPAddress ip = WiFi.softAPIP();
 
     // Captive-portal DNS: every domain resolves to our IP so phones treat us
@@ -928,6 +1094,8 @@ static void enter_ap_mode() {
     web_server = new AsyncWebServer(80);
     web_server->on("/", HTTP_GET, ap_handle_root);
     web_server->on("/api/books", HTTP_GET, ap_handle_books_json);
+    web_server->on("/api/settings", HTTP_GET, ap_handle_settings_get);
+    web_server->on("/api/settings", HTTP_POST, ap_handle_settings_post);
     web_server->on("/ping", HTTP_GET, [](AsyncWebServerRequest *r) {
         Serial.println("[HTTP] GET /ping");
         r->send(200, "text/plain", "pong");
@@ -963,6 +1131,7 @@ static void enter_ap_mode() {
     ap_active = true;
     ap_last_activity = millis();
     ap_started_at = millis();
+    ap_idle_timeout_ms = (uint32_t)g_settings.ap_idle_minutes * 60UL * 1000UL;
     Serial.printf("[AP] up: SSID=%s pw=%s ip=%s\n",
                   ap_ssid.c_str(), ap_password.c_str(),
                   WiFi.softAPIP().toString().c_str());
@@ -1048,6 +1217,9 @@ void setup() {
 
     // Register WiFi event callback once (was inside enter_ap_mode → stacked).
     WiFi.onEvent(on_wifi_event);
+
+    load_settings();
+    apply_density();
 
     scan_sd_for_epubs();
     clear_and_flush();
@@ -1140,7 +1312,7 @@ void loop() {
     if (ap_active) {
         if (dns_server) dns_server->processNextRequest();
         // AsyncWebServer runs its own task; no handleClient() needed.
-        if (now - ap_last_activity > AP_IDLE_TIMEOUT_MS) {
+        if (now - ap_last_activity > ap_idle_timeout_ms) {
             Serial.println("[AP] idle timeout");
             exit_ap_mode();
             return;
@@ -1178,7 +1350,11 @@ void loop() {
                               xs[0], ys[0], zone, app_mode);
                 Serial.flush();
                 if (app_mode == MODE_BOOK) {
-                    if (xs[0] < EPD_WIDTH / 2) book_prev_page();
+                    if (ys[0] < 80) {
+                        Serial.println("[TAP] top → back to library");
+                        app_mode = MODE_LIBRARY;
+                        render_book_list();
+                    } else if (xs[0] < EPD_WIDTH / 2) book_prev_page();
                     else book_next_page();
                 } else {
                     if (zone == 1) move_selection(-1);
