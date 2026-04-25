@@ -1053,8 +1053,20 @@ static int chapter_jump_hit_test(int16_t x, int16_t y) {
     return sp;
 }
 
-// Read-only TODO list view. Editing happens in the hub web UI; on the device
-// we just show the saved items so the user can glance at them without WiFi.
+// Convert a tap on the TODO list view into the item index, or -1 if outside
+// any row. Touch Y is inverted relative to render Y, same fix as chapter_jump.
+static int todo_hit_test(int16_t x, int16_t y) {
+    int screen_y = EPD_HEIGHT - 1 - y;
+    int rows_top = LIST_Y + 60 - 30;
+    int row = (screen_y - rows_top) / LINE_HEIGHT;
+    const int max_rows = 8;
+    if (row < 0 || row >= max_rows) return -1;
+    if (row >= (int)g_todos.size()) return -1;
+    return row;
+}
+
+// Tappable TODO list view. Tap a row → toggle done. Editing of *content*
+// (text, add, remove) still happens in the hub web UI.
 static void render_todo_list() {
     Serial.printf("render_todo_list: %u items\n", (unsigned)g_todos.size());
     Serial.flush();
@@ -1100,7 +1112,7 @@ static void render_todo_list() {
     draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
     int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
     writeln((GFXfont *)&firasans_small,
-            "tap bottom-right or center to return to library    button = same",
+            "tap a row = toggle done    tap top or bottom-right = library    button = same",
             &fx, &fy, framebuffer);
 
     epd_poweron();
@@ -2103,10 +2115,20 @@ void loop() {
                 bool corner_right = (xs[0] > EPD_WIDTH - 100 &&
                                      ys[0] > EPD_HEIGHT - 100);
                 if (app_mode == MODE_TODO) {
-                    if (corner_right || zone == 2) {
+                    // Top edge or bottom-right corner exits.
+                    if (ys[0] > EPD_HEIGHT - 80 || corner_right) {
                         Serial.println("[TAP] exit TODO -> library");
                         app_mode = MODE_LIBRARY;
                         render_book_list();
+                    } else {
+                        int row = todo_hit_test(xs[0], ys[0]);
+                        if (row >= 0) {
+                            g_todos[row].done = !g_todos[row].done;
+                            Serial.printf("[TODO] toggle row %d -> %s\n",
+                                          row, g_todos[row].done ? "done" : "open");
+                            save_todos();
+                            render_todo_list();
+                        }
                     }
                 } else if (app_mode == MODE_BOOK_END) {
                     if (xs[0] < EPD_WIDTH / 2 && ys[0] < EPD_HEIGHT - 80) {
