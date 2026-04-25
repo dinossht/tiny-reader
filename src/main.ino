@@ -942,6 +942,10 @@ static void ap_handle_settings_post(AsyncWebServerRequest *req) {
         int m = req->getParam("ap_idle_minutes", true)->value().toInt();
         if (m >= 1 && m <= 120 && m != g_settings.ap_idle_minutes) {
             g_settings.ap_idle_minutes = m;
+            // Apply to the live session too so the user doesn't have to
+            // re-enter AP for a longer timeout to take effect.
+            ap_idle_timeout_ms = (uint32_t)m * 60UL * 1000UL;
+            Serial.printf("[AP] idle timeout updated live to %d min\n", m);
             changed = true;
         }
     }
