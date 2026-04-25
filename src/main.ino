@@ -49,7 +49,7 @@ static uint8_t *framebuffer = nullptr;
 static TouchDrvGT911 touch;
 static bool touchOnline = false;
 
-enum AppMode { MODE_LIBRARY, MODE_BOOK };
+enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO };
 static AppMode app_mode = MODE_LIBRARY;
 
 // library mode
@@ -793,7 +793,7 @@ static void render_book_list() {
     cx = LIST_X;
     cy = EPD_HEIGHT - 50;
     writeln((GFXfont *)&firasans_small,
-            "tap left/right = navigate    tap center = open",
+            "tap left/right = navigate   tap center = open   tap top-right = TODO",
             &cx, &cy, framebuffer);
     cx = LIST_X;
     cy = EPD_HEIGHT - 12;
@@ -813,6 +813,62 @@ static void render_book_list() {
         Serial.println("[STR_100] press detected (library post-render)");
         str100_pressed = true;
     }
+}
+
+// Read-only TODO list view. Editing happens in the hub web UI; on the device
+// we just show the saved items so the user can glance at them without WiFi.
+static void render_todo_list() {
+    Serial.printf("render_todo_list: %u items\n", (unsigned)g_todos.size());
+    Serial.flush();
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int32_t cx = LIST_X, cy = LIST_Y;
+    char header[64];
+    int n_done = 0;
+    for (const auto &it : g_todos) if (it.done) ++n_done;
+    snprintf(header, sizeof(header), "TODO  (%u/%u done)",
+             (unsigned)n_done, (unsigned)g_todos.size());
+    writeln((GFXfont *)&FiraSans, header, &cx, &cy, framebuffer);
+
+    if (g_todos.empty()) {
+        cx = LIST_X; cy = LIST_Y + 120;
+        writeln((GFXfont *)&FiraSans, "No TODO items yet.",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy = LIST_Y + 180;
+        writeln((GFXfont *)&FiraSans,
+                "Add some via the hub web UI.",
+                &cx, &cy, framebuffer);
+    } else {
+        const int max_rows = 8;
+        for (size_t i = 0; i < g_todos.size() && (int)i < max_rows; ++i) {
+            cx = LIST_X + 40;
+            cy = LIST_Y + 60 + (int)i * LINE_HEIGHT;
+            const char *prefix = g_todos[i].done ? "[x] " : "[ ] ";
+            std::string line = std::string(prefix) + g_todos[i].text;
+            if (line.size() > 56) line = line.substr(0, 53) + "...";
+            writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
+        }
+        if ((int)g_todos.size() > max_rows) {
+            cx = LIST_X + 40;
+            cy = LIST_Y + 60 + max_rows * LINE_HEIGHT;
+            char more[40];
+            snprintf(more, sizeof(more), "... and %d more (see hub)",
+                     (int)g_todos.size() - max_rows);
+            writeln((GFXfont *)&FiraSans, more, &cx, &cy, framebuffer);
+        }
+    }
+
+    // Footer: divider + small hint
+    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
+    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
+    writeln((GFXfont *)&firasans_small,
+            "tap top-right to return to library    button = same",
+            &fx, &fy, framebuffer);
+
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
 }
 
 static void move_selection(int delta) {
@@ -1714,6 +1770,9 @@ static void handle_serial_commands() {
                 if (app_mode == MODE_BOOK && ch >= 0 && ch < total_spine) {
                     if (load_chapter(ch)) render_book_page();
                 }
+            } else if (cmd == "todo") {
+                app_mode = MODE_TODO;
+                render_todo_list();
             } else if (cmd == "share") {
                 enter_ap_mode();
             } else if (cmd == "stop_share" || cmd == "unshare") {
@@ -1800,15 +1859,28 @@ void loop() {
                 Serial.printf("tap (%d,%d) zone=%d mode=%d\n",
                               xs[0], ys[0], zone, app_mode);
                 Serial.flush();
-                if (app_mode == MODE_BOOK) {
+                // Top-right corner (x > EPD_WIDTH - 100, y < 80) toggles TODO view
+                // from library, and exits TODO view back to library.
+                bool top_right = (xs[0] > EPD_WIDTH - 100 && ys[0] < 80);
+                if (app_mode == MODE_TODO) {
+                    if (top_right || zone == 2) {
+                        Serial.println("[TAP] exit TODO -> library");
+                        app_mode = MODE_LIBRARY;
+                        render_book_list();
+                    }
+                } else if (app_mode == MODE_BOOK) {
                     if (ys[0] < 80) {
                         Serial.println("[TAP] top → back to library");
                         app_mode = MODE_LIBRARY;
                         render_book_list();
                     } else if (xs[0] < EPD_WIDTH / 2) book_prev_page();
                     else book_next_page();
-                } else {
-                    if (zone == 1) move_selection(-1);
+                } else {  // MODE_LIBRARY
+                    if (top_right) {
+                        Serial.println("[TAP] top-right -> TODO view");
+                        app_mode = MODE_TODO;
+                        render_todo_list();
+                    } else if (zone == 1) move_selection(-1);
                     else if (zone == 3) move_selection(+1);
                     else if (zone == 2) open_selected();
                 }
@@ -1845,7 +1917,7 @@ void loop() {
                     Serial.println("[BTN] long press (released) → AP mode");
                     enter_ap_mode();
                     input_cooldown_until = now + 1000;
-                } else if (app_mode == MODE_BOOK) {
+                } else if (app_mode == MODE_BOOK || app_mode == MODE_TODO) {
                     app_mode = MODE_LIBRARY;
                     render_book_list();
                     input_cooldown_until = now + 600;
