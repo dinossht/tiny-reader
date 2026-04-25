@@ -26,6 +26,7 @@
 
 #include "epd_driver.h"
 #include "firasans.h"
+#include "firasans_small.h"   // smaller bitmap font for footer/status lines
 #include "utilities.h"
 #include <TouchDrvGT911.hpp>
 #include "Epub.h"
@@ -577,11 +578,13 @@ static void render_book_page() {
     int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
-    // 3-column footer: [battery%] [Ch X/Y · NN%] [page A/B]
+    // 3-column footer rendered in the smaller font so it occupies less vertical
+    // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B]
     int book_progress_pct = (total_spine > 0)
         ? (current_spine * 100) / total_spine
         : 0;
-    int32_t footer_y = EPD_HEIGHT - 15;
+    const GFXfont *small = (const GFXfont *)&firasans_small;
+    int32_t footer_y = EPD_HEIGHT - 12;
     char left[24], center[40], right[24];
     snprintf(left, sizeof(left), "%d%%", read_battery_percent());
     snprintf(center, sizeof(center), "Ch %d/%d  -  %d%% read",
@@ -590,17 +593,17 @@ static void render_book_page() {
              current_page_in_chapter + 1, (int)chapter_pages.size());
 
     int32_t lx = BOOK_MARGIN_X, ly = footer_y;
-    writeln((GFXfont *)&FiraSans, left, &lx, &ly, framebuffer);
+    writeln(small, left, &lx, &ly, framebuffer);
 
     int32_t cw, ch_ = 0, cmx = 0, cmy = 0, cmx1, cmy1;
-    get_text_bounds((GFXfont *)&FiraSans, center, &cmx, &cmy, &cmx1, &cmy1, &cw, &ch_, NULL);
+    get_text_bounds(small, center, &cmx, &cmy, &cmx1, &cmy1, &cw, &ch_, NULL);
     int32_t cx_ = (EPD_WIDTH - cw) / 2, cy_ = footer_y;
-    writeln((GFXfont *)&FiraSans, center, &cx_, &cy_, framebuffer);
+    writeln(small, center, &cx_, &cy_, framebuffer);
 
     int32_t rw, rh_ = 0, rmx = 0, rmy = 0, rmx1, rmy1;
-    get_text_bounds((GFXfont *)&FiraSans, right, &rmx, &rmy, &rmx1, &rmy1, &rw, &rh_, NULL);
+    get_text_bounds(small, right, &rmx, &rmy, &rmx1, &rmy1, &rw, &rh_, NULL);
     int32_t rx = EPD_WIDTH - BOOK_MARGIN_X - rw, ry = footer_y;
-    writeln((GFXfont *)&FiraSans, right, &rx, &ry, framebuffer);
+    writeln(small, right, &rx, &ry, framebuffer);
 
     epd_poweron();
     epd_clear();
@@ -715,16 +718,16 @@ static void render_book_list() {
         }
     }
 
-    // footer: tap zones legend on two short lines so it fits the wide bitmap font.
+    // footer: tap zones legend in the smaller font.
     cx = LIST_X;
-    cy = EPD_HEIGHT - 70;
-    writeln((GFXfont *)&FiraSans,
+    cy = EPD_HEIGHT - 50;
+    writeln((GFXfont *)&firasans_small,
             "tap left/right = navigate    tap center = open",
             &cx, &cy, framebuffer);
     cx = LIST_X;
-    cy = EPD_HEIGHT - 20;
-    writeln((GFXfont *)&FiraSans,
-            "hold button: 2s = WiFi share    5s = sleep",
+    cy = EPD_HEIGHT - 12;
+    writeln((GFXfont *)&firasans_small,
+            "hold button:  2s = WiFi share    5s = sleep",
             &cx, &cy, framebuffer);
 
     epd_poweron();
