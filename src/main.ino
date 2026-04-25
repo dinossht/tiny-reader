@@ -49,7 +49,7 @@ static uint8_t *framebuffer = nullptr;
 static TouchDrvGT911 touch;
 static bool touchOnline = false;
 
-enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP };
+enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP, MODE_BOOK_END };
 static AppMode app_mode = MODE_LIBRARY;
 
 // library mode
@@ -731,10 +731,19 @@ static void render_book_page() {
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
     // 3-column footer rendered in the smaller font so it occupies less vertical
-    // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B]
-    int book_progress_pct = (total_spine > 0)
-        ? (current_spine * 100) / total_spine
-        : 0;
+    // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B].
+    // book_progress_pct counts chapters completed + the fraction of pages read
+    // in the current chapter, so the last page of the last chapter is 100%.
+    int book_progress_pct = 0;
+    if (total_spine > 0 && !chapter_pages.empty()) {
+        int chap_pages = (int)chapter_pages.size();
+        int read_pages = chap_pages * current_spine + (current_page_in_chapter + 1);
+        int total_pages_est = chap_pages * total_spine;
+        if (total_pages_est > 0) {
+            book_progress_pct = (read_pages * 100 + total_pages_est / 2) / total_pages_est;
+            if (book_progress_pct > 100) book_progress_pct = 100;
+        }
+    }
     const GFXfont *small = (const GFXfont *)&firasans_small;
     int32_t footer_y = EPD_HEIGHT - 12;
     // divider just above the footer text
@@ -784,6 +793,40 @@ static void render_book_page() {
     }
 }
 
+// "You finished the book!" screen shown after the last page. From here a tap
+// goes back to the library; a long button-press still does AP/sleep.
+static void render_book_end() {
+    Serial.println("[BOOK] reached end-of-book");
+    Serial.flush();
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int32_t cx = LIST_X, cy = 200;
+    writeln((GFXfont *)&FiraSans, "You finished the book.",
+            &cx, &cy, framebuffer);
+
+    cx = LIST_X; cy = 280;
+    char info[80];
+    if (selected >= 0 && selected < (int)books.size()) {
+        std::string title = books[selected];
+        size_t dot = title.rfind(".epub");
+        if (dot != std::string::npos) title.erase(dot);
+        if (title.size() > 50) title = title.substr(0, 47) + "...";
+        snprintf(info, sizeof(info), "%s", title.c_str());
+        writeln((GFXfont *)&FiraSans, info, &cx, &cy, framebuffer);
+    }
+
+    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
+    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
+    writeln((GFXfont *)&firasans_small,
+            "tap left = re-read last page    tap anywhere else = library",
+            &fx, &fy, framebuffer);
+
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
+
 // Advance/go-back a page; cross chapter boundaries by loading next/prev spine item.
 static void book_next_page() {
     if (current_page_in_chapter + 1 < (int)chapter_pages.size()) {
@@ -792,6 +835,10 @@ static void book_next_page() {
         save_position();
     } else if (current_spine + 1 < total_spine) {
         if (load_chapter(current_spine + 1)) { render_book_page(); save_position(); }
+    } else {
+        // last page of last chapter — show the end screen
+        app_mode = MODE_BOOK_END;
+        render_book_end();
     }
 }
 
@@ -2061,6 +2108,14 @@ void loop() {
                         app_mode = MODE_LIBRARY;
                         render_book_list();
                     }
+                } else if (app_mode == MODE_BOOK_END) {
+                    if (xs[0] < EPD_WIDTH / 2 && ys[0] < EPD_HEIGHT - 80) {
+                        app_mode = MODE_BOOK;
+                        render_book_page();
+                    } else {
+                        app_mode = MODE_LIBRARY;
+                        render_book_list();
+                    }
                 } else if (app_mode == MODE_CHAPTER_JUMP) {
                     if (ys[0] > EPD_HEIGHT - 80) {
                         // Top strip: paginate or cancel.
@@ -2171,7 +2226,8 @@ void loop() {
                     app_mode = MODE_BOOK;
                     render_book_page();
                     input_cooldown_until = now + 600;
-                } else if (app_mode == MODE_BOOK || app_mode == MODE_TODO) {
+                } else if (app_mode == MODE_BOOK || app_mode == MODE_TODO ||
+                           app_mode == MODE_BOOK_END) {
                     app_mode = MODE_LIBRARY;
                     render_book_list();
                     input_cooldown_until = now + 600;
