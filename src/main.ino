@@ -668,35 +668,39 @@ static String pos_path_for_name(const String &name) {
     return String("/") + name.substring(0, dot) + ".pos";
 }
 
-// .pos format: "<spine> <page> [<percent>]\n". Percent is appended so the
-// library row can show progress that matches the book footer; legacy two-int
-// files (written before this) are read back with percent=0.
+// .pos format: "<spine> <page> [<percent> [<chapter_pages>]]\n".
+// chapter_pages records how many pages the chapter had at save time. On
+// load with a different density, page is rescaled proportionally so the
+// reader lands at roughly the same place even though the page count
+// differs. Legacy two/three-int files are still readable.
 static bool read_position_for_name(const String &name, int *out_spine,
-                                   int *out_page, int *out_percent = nullptr) {
+                                   int *out_page, int *out_percent = nullptr,
+                                   int *out_chap_pages = nullptr) {
     File f = SD.open(pos_path_for_name(name), FILE_READ);
     if (!f) return false;
     String line = f.readStringUntil('\n');
     f.close();
-    int sp = -1, pg = -1, pct = 0;
-    int n = sscanf(line.c_str(), "%d %d %d", &sp, &pg, &pct);
+    int sp = -1, pg = -1, pct = 0, cp = 0;
+    int n = sscanf(line.c_str(), "%d %d %d %d", &sp, &pg, &pct, &cp);
     if (n >= 2) {
         *out_spine = sp;
         *out_page = pg;
-        if (out_percent) *out_percent = (n >= 3) ? pct : 0;
+        if (out_percent)    *out_percent    = (n >= 3) ? pct : 0;
+        if (out_chap_pages) *out_chap_pages = (n >= 4) ? cp  : 0;
         return true;
     }
     return false;
 }
 
 static bool write_position_for_name(const String &name, int spine, int page,
-                                    int percent = 0) {
+                                    int percent = 0, int chap_pages = 0) {
     String path = pos_path_for_name(name);
     File f = SD.open(path, FILE_WRITE);
     if (!f) { Serial.printf("write_position: open %s failed\n", path.c_str()); return false; }
-    f.printf("%d %d %d\n", spine, page, percent);
+    f.printf("%d %d %d %d\n", spine, page, percent, chap_pages);
     f.close();
-    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d %d%%\n",
-                  path.c_str(), spine, page, percent);
+    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d/%d %d%%\n",
+                  path.c_str(), spine, page, chap_pages, percent);
     return true;
 }
 
@@ -718,14 +722,19 @@ static void save_position() {
     if (selected < 0 || selected >= (int)books.size()) return;
     write_position_for_name(String(books[selected].c_str()),
                             current_spine, current_page_in_chapter,
-                            compute_book_progress_pct());
+                            compute_book_progress_pct(),
+                            (int)chapter_pages.size());
 }
 
-static bool load_position(int *out_spine, int *out_page) {
+static bool load_position(int *out_spine, int *out_page,
+                          int *out_chap_pages = nullptr) {
     if (selected < 0 || selected >= (int)books.size()) return false;
+    int dummy_pct = 0, cp = 0;
     bool ok = read_position_for_name(String(books[selected].c_str()),
-                                     out_spine, out_page);
-    if (ok) Serial.printf("[POS_LOADED] ch=%d p=%d\n", *out_spine, *out_page);
+                                     out_spine, out_page, &dummy_pct, &cp);
+    if (out_chap_pages) *out_chap_pages = cp;
+    if (ok) Serial.printf("[POS_LOADED] ch=%d p=%d (was /%d)\n",
+                          *out_spine, *out_page, cp);
     return ok;
 }
 
@@ -1114,6 +1123,20 @@ static void draw_rect_rounded(int x0, int y0, int x1, int y1, int r,
     }
 }
 
+// Push the current framebuffer to the EPD. Always does an epd_clear()
+// flash first — without it, the e-paper retains previous content and
+// each render layers on top. True diff-based partial refresh would need
+// epdiy's hi-level API which our vendored LilyGo lib doesn't expose.
+// The `force_full` arg is kept for callers that pass it, but the
+// behaviour is the same in both cases now.
+static void flush_framebuffer(bool force_full = false) {
+    (void)force_full;
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
+
 // Right-pointing filled triangle "▶" — used as the selection cursor in the
 // library and chapter-jump screens. (x, y_top) is the bounding box top-left;
 // width is ~3/4 of `size` so it has a tasteful aspect ratio.
@@ -1229,10 +1252,9 @@ static void render_book_page() {
     writeln(small, right, &rx_text, &ry, framebuffer);
     draw_battery_icon(text_start_x - 42, footer_y - 9, batt_pct, framebuffer);
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    // Page turn: skip the white flash on most renders; full clear every
+    // FULL_REFRESH_EVERY turns to wash out accumulated ghosting.
+    flush_framebuffer(/*force_full=*/false);
 
     // EPD is now electrically idle — safe window to peek at GPIO 0 (STR_100).
     // We latch a flag rather than acting here so loop() consumes it.
@@ -1266,10 +1288,7 @@ static void render_book_end() {
 
     // (no footer hints on the end screen — feels nicer to land on)
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 }
 
 // Advance/go-back a page; cross chapter boundaries by loading next/prev spine item.
@@ -1456,10 +1475,7 @@ static void render_book_list() {
 
     draw_corner_button("tiny-todo");
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 
     // Same idle-window peek as render_book_page(). In library mode the latch
     // is a debug-log only (see loop()), but we still keep it warm so the user
@@ -1539,10 +1555,7 @@ static void render_chapter_jump() {
 
     // (footer hints intentionally removed)
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 }
 
 // Returns the TOC index that was tapped, or -1 if the tap missed every row.
@@ -1630,10 +1643,7 @@ static void render_todo_list() {
 
     draw_corner_button("tiny-reader");
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 }
 
 static void move_selection(int delta) {
@@ -1653,16 +1663,30 @@ static void open_selected() {
 
     current_book_path = std::string("/sd/") + books[selected];
 
-    // Try to resume from saved position.
-    int saved_ch = 0, saved_pg = 0;
-    bool resumed = load_position(&saved_ch, &saved_pg);
+    // Try to resume from saved position. If the .pos sidecar also recorded
+    // the chapter's page count at save time, scale `saved_pg` to the
+    // current pagination — covers the "user changed density between
+    // sessions" case so we land at roughly the same place rather than at
+    // a literal "page N" of a totally different layout.
+    int saved_ch = 0, saved_pg = 0, saved_chap_pages = 0;
+    bool resumed = load_position(&saved_ch, &saved_pg, &saved_chap_pages);
 
     if (load_chapter(resumed ? saved_ch : 0)) {
         Serial.printf("Loaded book: spine=%d, chapter has %u pages%s\n",
                       total_spine, (unsigned)chapter_pages.size(),
                       resumed ? " (resumed)" : "");
-        if (resumed && saved_pg >= 0 && saved_pg < (int)chapter_pages.size()) {
-            current_page_in_chapter = saved_pg;
+        if (resumed) {
+            int target = saved_pg;
+            int new_pages = (int)chapter_pages.size();
+            if (saved_chap_pages > 0 && new_pages > 0 &&
+                saved_chap_pages != new_pages) {
+                target = (int)((int64_t)saved_pg * new_pages / saved_chap_pages);
+                Serial.printf("[POS_RESCALE] %d/%d -> %d/%d\n",
+                              saved_pg, saved_chap_pages, target, new_pages);
+            }
+            if (target < 0) target = 0;
+            if (target >= new_pages) target = new_pages - 1;
+            current_page_in_chapter = target;
         }
         app_mode = MODE_BOOK;
         render_book_page();
@@ -1754,10 +1778,7 @@ static void render_ap_screen() {
              WiFi.softAPIP().toString().c_str());
     writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 }
 
 // Async handlers below take AsyncWebServerRequest *req.
@@ -2001,16 +2022,16 @@ static void ap_handle_book_path(AsyncWebServerRequest *req) {
                      sp, pg, pct, ok ? "true" : "false");
             req->send(200, "application/json", buf);
         } else if (req->method() == HTTP_POST) {
-            int sp = 0, pg = 0, pct = 0;
-            // Preserve any existing percent so a hub edit doesn't reset
-            // the library progress display until the user opens the book.
+            int sp = 0, pg = 0, pct = 0, cp = 0;
+            // Preserve existing percent + chapter_pages so a hub edit
+            // doesn't lose the scaling info or the library progress %.
             int prev_sp = 0, prev_pg = 0;
-            read_position_for_name(name, &prev_sp, &prev_pg, &pct);
+            read_position_for_name(name, &prev_sp, &prev_pg, &pct, &cp);
             if (req->hasParam("spine", true)) sp = req->getParam("spine", true)->value().toInt();
             if (req->hasParam("page",  true)) pg = req->getParam("page",  true)->value().toInt();
             if (sp < 0) sp = 0;
             if (pg < 0) pg = 0;
-            bool ok = write_position_for_name(name, sp, pg, pct);
+            bool ok = write_position_for_name(name, sp, pg, pct, cp);
             req->send(ok ? 200 : 500, "application/json",
                       ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
         } else {
@@ -2358,10 +2379,7 @@ static void enter_deep_sleep() {
     cx = 60; cy = 340;
     writeln((GFXfont *)&FiraSans,
             "(Your reading position is saved.)", &cx, &cy, framebuffer);
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 
     // Wait for the button to be released before arming wake — otherwise ext0
     // sees it still LOW and wakes the chip immediately, looking like sleep
