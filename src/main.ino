@@ -32,6 +32,7 @@
 #include "freesans_body_bold.h"      // 22pt body bold
 #include "freesans_body_italic.h"    // 22pt body italic (oblique)
 #include "freesans_body_bolditalic.h" // 22pt body bold-italic
+#include "freesans_title.h"          // 32pt title font for screen headers
 #include "logo.h"                    // 1-bit packed boot-splash logo
 #include "hub_html.h"                // generated from src/hub.html (HUB_HTML[])
 #include "utilities.h"
@@ -365,12 +366,32 @@ static std::string decode_entities(const std::string &s) {
         out.push_back(s[i]);
         ++i;
     }
-    // ASCII-style typographic substitutions: "--" → em-dash, "..." → ellipsis.
-    // Smart-quote auto-detection (straight " → curly) is context-sensitive
-    // and modern EPUBs already ship curly quotes; skip it.
+    // ASCII-style typographic substitutions + collapse Unicode whitespace
+    // (NBSP, thin/hair space, narrow no-break space) to ASCII space so that
+    // word-tokenizers downstream split correctly. Without this, an EPUB
+    // that used `&#160;` between words inside `<em>...</em>` ends up
+    // rendered as one merged blob.
     std::string t;
     t.reserve(out.size());
     for (size_t i = 0; i < out.size(); ++i) {
+        // Multi-byte Unicode space sequences in UTF-8.
+        if (i + 1 < out.size() &&
+            (uint8_t)out[i] == 0xC2 && (uint8_t)out[i + 1] == 0xA0) {
+            // U+00A0 NBSP
+            t.push_back(' ');
+            i += 1;
+            continue;
+        }
+        if (i + 2 < out.size() && (uint8_t)out[i] == 0xE2 &&
+            (uint8_t)out[i + 1] == 0x80) {
+            uint8_t b2 = (uint8_t)out[i + 2];
+            // U+2002..U+200A and U+202F whitespace forms
+            if ((b2 >= 0x82 && b2 <= 0x8A) || b2 == 0xAF) {
+                t.push_back(' ');
+                i += 2;
+                continue;
+            }
+        }
         if (i + 1 < out.size() && out[i] == '-' && out[i + 1] == '-') {
             t += "\xE2\x80\x94"; // —
             i += 1;
@@ -387,11 +408,25 @@ static std::string decode_entities(const std::string &s) {
 
 // Strip XHTML tags into plain text. Block-level closing tags become \n.
 // Skip everything inside <head>, <script>, <style>.
+// Inline style markers used in the stripped text. These are ASCII control
+// bytes that pass through wrap/paginate untouched and are interpreted by
+// render_line to swap fonts mid-line. Zero-width in width calculations.
+static const char STY_BOLD_ON    = '\x01';
+static const char STY_BOLD_OFF   = '\x02';
+static const char STY_ITALIC_ON  = '\x03';
+static const char STY_ITALIC_OFF = '\x04';
+static inline bool is_style_marker(char c) {
+    return c == STY_BOLD_ON || c == STY_BOLD_OFF ||
+           c == STY_ITALIC_ON || c == STY_ITALIC_OFF;
+}
+
 static std::string strip_xhtml(const char *src, size_t len) {
     std::string out;
     out.reserve(len);
     bool in_tag = false;
     int skip_depth = 0;     // >0 while inside head/script/style
+    int bold_depth = 0;     // nested <b>/<strong>
+    int italic_depth = 0;   // nested <em>/<i>
     std::string tag;
     auto is_block = [](const std::string &t){
         return t == "p" || t == "br" || t == "div" || t == "li" || t == "blockquote" ||
@@ -419,6 +454,22 @@ static std::string strip_xhtml(const char *src, size_t len) {
                 else ++skip_depth;
             } else if (skip_depth == 0 && is_block(name)) {
                 if (out.empty() || out.back() != '\n') out.push_back('\n');
+            } else if (skip_depth == 0 && (name == "b" || name == "strong")) {
+                if (is_close) {
+                    if (bold_depth > 0) --bold_depth;
+                    if (bold_depth == 0) out.push_back(STY_BOLD_OFF);
+                } else {
+                    if (bold_depth == 0) out.push_back(STY_BOLD_ON);
+                    ++bold_depth;
+                }
+            } else if (skip_depth == 0 && (name == "em" || name == "i")) {
+                if (is_close) {
+                    if (italic_depth > 0) --italic_depth;
+                    if (italic_depth == 0) out.push_back(STY_ITALIC_OFF);
+                } else {
+                    if (italic_depth == 0) out.push_back(STY_ITALIC_ON);
+                    ++italic_depth;
+                }
             }
             continue;
         }
@@ -449,8 +500,15 @@ static std::vector<std::string> wrap_text(const std::string &text) {
     const GFXfont *font = g_body_font;
 
     auto measure = [font](const char *s) -> int {
+        // Strip inline style markers — they're zero-width directives, not
+        // glyphs. Measure with the regular body font; bold variants are
+        // ~5% wider, but using one font for layout keeps wrap stable.
+        std::string t;
+        for (const char *p = s; *p; ++p) {
+            if (!is_style_marker(*p)) t.push_back(*p);
+        }
         int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-        get_text_bounds(font, s, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        get_text_bounds(font, t.c_str(), &mx, &my, &mx1, &my1, &mw, &mh, NULL);
         return (int)mw;
     };
 
@@ -706,10 +764,73 @@ static void dump_current_page_to_serial() {
 
 // Render a single line, optionally distributing slack between words so that
 // the rendered width matches `target_w`.
+// Style-aware font picker. Tracks bold/italic state across calls within a
+// single render_line invocation by reading the marker bytes embedded in the
+// text.
+static const GFXfont *font_for_style(const GFXfont *base, bool bold, bool italic) {
+    // Only honor styling for the medium body font (matching variants exist).
+    // For compact / loose density we fall back to the base.
+    if (base != (const GFXfont *)&freesans_body) return base;
+    if (bold && italic) return (const GFXfont *)&freesans_body_bolditalic;
+    if (bold)           return (const GFXfont *)&freesans_body_bold;
+    if (italic)         return (const GFXfont *)&freesans_body_italic;
+    return base;
+}
+
+// Update style state from a marker byte. Idempotent for non-markers.
+static inline void apply_marker(char m, bool &bold, bool &italic) {
+    switch (m) {
+        case STY_BOLD_ON:    bold   = true;  break;
+        case STY_BOLD_OFF:   bold   = false; break;
+        case STY_ITALIC_ON:  italic = true;  break;
+        case STY_ITALIC_OFF: italic = false; break;
+    }
+}
+
+// Measure / draw a "word" (no spaces) that may contain style markers.
+// Splits the word at marker boundaries and processes each segment with the
+// font matching the current style. Returns the rendered width.
+// If `fb` is NULL, just measures.
+static int draw_or_measure_styled_word(const GFXfont *base_font,
+                                       const char *word, int len,
+                                       bool &bold, bool &italic,
+                                       int32_t x, int32_t y, uint8_t *fb) {
+    int total_w = 0;
+    int seg_start = 0;
+    auto flush = [&](int upto) {
+        if (upto <= seg_start) return;
+        std::string seg(word + seg_start, upto - seg_start);
+        const GFXfont *f = font_for_style(base_font, bold, italic);
+        if (fb) {
+            // Drawing pass: trust writeln's actual cursor advance.
+            int32_t cx = x + total_w, cy = y;
+            int32_t cx_init = cx;
+            writeln((GFXfont *)f, seg.c_str(), &cx, &cy, fb);
+            int adv = cx - cx_init;
+            total_w += adv;
+            return;
+        }
+        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+        get_text_bounds(f, seg.c_str(), &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        total_w += mx;
+    };
+    for (int i = 0; i <= len; ++i) {
+        char c = (i < len) ? word[i] : '\0';
+        if (i == len) { flush(i); break; }
+        if (is_style_marker(c)) {
+            flush(i);
+            apply_marker(c, bold, italic);
+            seg_start = i + 1;
+        }
+    }
+    return total_w;
+}
+
 static void render_line(const GFXfont *font, const char *line,
                         int x_start, int target_w, int32_t y,
                         uint8_t *fb, bool justify) {
-    // tokenize words
+    // tokenize words. Style markers stay attached to whichever word they
+    // sit next to (typically prefix of next word or suffix of current).
     std::vector<std::string> words;
     {
         std::string cur;
@@ -721,39 +842,62 @@ static void render_line(const GFXfont *font, const char *line,
     }
     if (words.empty()) return;
 
+    // Style state persists across words within the line.
+    bool bold = false, italic = false;
+
     int32_t cx = x_start, cy = y;
 
+    // Space width — read the cursor advance after measuring " " (parameter
+    // *x), NOT the bbox width (*w). A space has no inked pixels so its
+    // bbox width is 0; the real width-between-words is advance_x.
+    int32_t sp_x = 0, by = 0, bx1, by1, bw, bh;
+    get_text_bounds(font, " ", &sp_x, &by, &bx1, &by1, &bw, &bh, NULL);
+    int sp_w = (int)sp_x;
+
     if (!justify || words.size() == 1) {
-        writeln((GFXfont *)font, line, &cx, &cy, fb);
+        int gaps = (int)words.size() - 1;
+        for (size_t i = 0; i < words.size(); ++i) {
+            int adv = draw_or_measure_styled_word(font, words[i].data(),
+                                                  (int)words[i].size(),
+                                                  bold, italic, cx, cy, fb);
+            cx += adv;
+            if ((int)i < gaps) cx += sp_w;
+        }
         return;
     }
 
-    // measure each word
+    // Measure each word with its current style sequence. Width depends on
+    // the order of markers, so use a copy of the state for measurement and
+    // restore for the draw pass.
+    bool m_bold = bold, m_italic = italic;
     std::vector<int> ww;
     int total_word_w = 0;
     for (auto &w : words) {
-        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-        get_text_bounds(font, w.c_str(), &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        int mw = draw_or_measure_styled_word(font, w.data(), (int)w.size(),
+                                             m_bold, m_italic, 0, 0, nullptr);
         ww.push_back(mw);
         total_word_w += mw;
     }
     int gaps = (int)words.size() - 1;
-    // baseline space width
-    int32_t mx = 0, my = 0, mx1, my1, sp_w, mh;
-    get_text_bounds(font, " ", &mx, &my, &mx1, &my1, &sp_w, &mh, NULL);
     int natural_w = total_word_w + sp_w * gaps;
     int slack = target_w - natural_w;
-    // bail out of justification if slack is huge (last short line, etc.)
     if (slack < 0 || slack > target_w / 3) {
-        writeln((GFXfont *)font, line, &cx, &cy, fb);
+        // Bail out of justification: just left-align with style switching.
+        for (auto &w : words) {
+            int adv = draw_or_measure_styled_word(font, w.data(), (int)w.size(),
+                                                  bold, italic, cx, cy, fb);
+            cx += adv + sp_w;
+        }
         return;
     }
-    int extra_total = slack;
-    int extra_each = extra_total / gaps;
-    int extra_rem = extra_total % gaps;
+    int extra_each = slack / gaps;
+    int extra_rem  = slack % gaps;
 
     for (size_t i = 0; i < words.size(); ++i) {
-        writeln((GFXfont *)font, words[i].c_str(), &cx, &cy, fb);
+        int adv = draw_or_measure_styled_word(font, words[i].data(),
+                                              (int)words[i].size(),
+                                              bold, italic, cx, cy, fb);
+        cx += adv;
         if ((int)i < gaps) {
             cx += sp_w + extra_each + ((int)i < extra_rem ? 1 : 0);
         }
@@ -1054,13 +1198,13 @@ static void render_book_page() {
     char left[80], center[24], right[24];
     std::string toc_label = get_toc_label_for(current_spine);
     if (!toc_label.empty()) {
-        if (toc_label.size() > 32) toc_label = toc_label.substr(0, 29) + "...";
-        snprintf(left, sizeof(left), "%s  -  %d%%",
-                 toc_label.c_str(), book_progress_pct);
+        if (toc_label.size() > 36) toc_label = toc_label.substr(0, 33) + "...";
+        snprintf(left, sizeof(left), "%s", toc_label.c_str());
     } else {
-        snprintf(left, sizeof(left), "Sec %d/%d  -  %d%%",
-                 current_spine + 1, total_spine, book_progress_pct);
+        snprintf(left, sizeof(left), "Sec %d/%d",
+                 current_spine + 1, total_spine);
     }
+    (void)book_progress_pct;  // retained for the (book-end) screen elsewhere
     snprintf(center, sizeof(center), "p %d / %d",
              current_page_in_chapter + 1, (int)chapter_pages.size());
     snprintf(right, sizeof(right), "%d%%", batt_pct);
@@ -1202,15 +1346,15 @@ static void render_book_list() {
     const GFXfont *body  = (GFXfont *)&FiraSans;
     const GFXfont *small = (const GFXfont *)&firasans_small;
 
-    // Header: small logo (1/3-scale stride sample) + "tiny-reader" title +
-    // optional right-aligned page indicator + thin divider underneath.
+    // Header: 1/2-scale logo + "tiny-reader" title in the larger 32pt face.
+    // Optional right-aligned page indicator on the same baseline.
     {
-        int sx = LIST_X, sy = 25;
+        int sx = LIST_X, sy = 20;
         int row_bytes = (LOGO_W + 7) / 8;
-        for (int y = 0; y < LOGO_H; y += 3) {
-            for (int x = 0; x < LOGO_W; x += 3) {
+        for (int y = 0; y < LOGO_H; y += 2) {
+            for (int x = 0; x < LOGO_W; x += 2) {
                 if (LOGO_BITMAP[y * row_bytes + (x >> 3)] & (0x80 >> (x & 7))) {
-                    int dy = sy + y / 3, dx = sx + x / 3;
+                    int dy = sy + y / 2, dx = sx + x / 2;
                     if (dy < 0 || dy >= EPD_HEIGHT || dx < 0 || dx >= EPD_WIDTH)
                         continue;
                     int idx = (dy * EPD_WIDTH + dx) / 2;
@@ -1219,8 +1363,9 @@ static void render_book_list() {
             }
         }
     }
-    int32_t hx = LIST_X + (LOGO_W / 3) + 18, hy = 75;
-    writeln(body, "tiny-reader", &hx, &hy, framebuffer);
+    const GFXfont *title = (const GFXfont *)&freesans_title;
+    int32_t hx = LIST_X + (LOGO_W / 2) + 24, hy = 88;
+    writeln(title, "tiny-reader", &hx, &hy, framebuffer);
 
     // Page indicator (top-right) only when the library spans >1 page.
     if (!books.empty()) {
@@ -1232,7 +1377,7 @@ static void render_book_list() {
                      cur_page + 1, total_pages);
             int32_t mx = 0, my = 0, mx1, my1, mw, mh;
             get_text_bounds(small, pageinfo, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
-            int32_t rx = EPD_WIDTH - LIST_X - mw, ry = 75;
+            int32_t rx = EPD_WIDTH - LIST_X - mw, ry = 88;
             writeln(small, pageinfo, &rx, &ry, framebuffer);
         }
     }
@@ -1579,14 +1724,14 @@ static String ap_build_books_json() {
 static void render_ap_screen() {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
 
-    // Header: small logo (1/3-scale stride sample) + "tiny-reader" title.
+    // Header: 1/2-scale logo + "tiny-reader" title in the larger 32pt face.
     {
-        int sx = 60, sy = 55;
+        int sx = 60, sy = 35;
         int row_bytes = (LOGO_W + 7) / 8;
-        for (int y = 0; y < LOGO_H; y += 3) {
-            for (int x = 0; x < LOGO_W; x += 3) {
+        for (int y = 0; y < LOGO_H; y += 2) {
+            for (int x = 0; x < LOGO_W; x += 2) {
                 if (LOGO_BITMAP[y * row_bytes + (x >> 3)] & (0x80 >> (x & 7))) {
-                    int dy = sy + y / 3, dx = sx + x / 3;
+                    int dy = sy + y / 2, dx = sx + x / 2;
                     if (dy < 0 || dy >= EPD_HEIGHT || dx < 0 || dx >= EPD_WIDTH)
                         continue;
                     int idx = (dy * EPD_WIDTH + dx) / 2;
@@ -1595,8 +1740,8 @@ static void render_ap_screen() {
             }
         }
     }
-    int32_t cx = 60 + (LOGO_W / 3) + 24, cy = 100;
-    writeln((GFXfont *)&FiraSans, "tiny-reader", &cx, &cy, framebuffer);
+    int32_t cx = 60 + (LOGO_W / 2) + 24, cy = 110;
+    writeln((GFXfont *)&freesans_title, "tiny-reader", &cx, &cy, framebuffer);
 
     // Single-line SSID + URL.
     char line[200];
