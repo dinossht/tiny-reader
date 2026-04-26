@@ -1,0 +1,632 @@
+// Generated from /home/dino/code/tiny-reader/src/hub.html; edit the .html, not this file.
+#pragma once
+
+static const char HUB_HTML[] PROGMEM = R"TINYREADER(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>tiny-reader</title>
+<style>
+ :root {
+  --bg: #f0f0f0;
+  --bg-card: #fafafa;
+  --bg-hover: #f5f5f5;
+  --ink: #1a1a1a;
+  --ink-light: #6b6b6b;
+  --ink-faint: #a0a0a0;
+  --accent: #333333;
+  --accent-hover: #1a1a1a;
+  --accent-soft: #e8e8e8;
+  --border: #d9d9d9;
+  --border-light: #e5e5e5;
+  --red: #666666;
+  --red-soft: #e0e0e0;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+  --shadow-md: 0 4px 16px rgba(0,0,0,0.08);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  --serif: Georgia, 'Source Serif Pro', 'Times New Roman', serif;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+ }
+
+ * { margin: 0; padding: 0; box-sizing: border-box; }
+
+ body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+ }
+ body::before {
+  content: '';
+  position: fixed; inset: 0;
+  background: url("data:image/svg+xml,%3Csvg width='60' height='60' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 0;
+ }
+
+ .container {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 32px 20px 80px;
+  position: relative;
+  z-index: 1;
+ }
+
+ header {
+  display: flex; align-items: center; gap: 16px;
+  margin-bottom: 40px; padding-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+ }
+ .logo {
+  width: 48px; height: 48px;
+  background: var(--ink); border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+ }
+ .logo svg { width: 30px; height: 30px; color: #f0f0f0; }
+ header h1 {
+  font-family: var(--serif);
+  font-size: 22px; font-weight: 600;
+  letter-spacing: -0.02em; line-height: 1.1;
+ }
+
+ section { margin-bottom: 24px; }
+ .section-label {
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--ink-faint);
+  margin-bottom: 10px; padding-left: 2px;
+ }
+ .card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  transition: box-shadow var(--transition);
+ }
+
+ /* Library */
+ .book-item {
+  display: flex; align-items: center; gap: 14px;
+  padding: 16px 18px;
+  transition: background var(--transition);
+ }
+ .book-item:hover { background: var(--bg-hover); }
+ .book-item + .book-item { border-top: 1px solid var(--border-light); }
+
+ .book-cover {
+  width: 42px; height: 58px;
+  border-radius: 4px;
+  flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--serif);
+  font-size: 18px; font-weight: 600;
+  color: white;
+  position: relative;
+  overflow: hidden;
+ }
+ .book-cover::after {
+  content: '';
+  position: absolute; left: 3px; top: 0; bottom: 0;
+  width: 2px;
+  background: rgba(255,255,255,0.2);
+  border-radius: 1px;
+ }
+ .cover-0 { background: linear-gradient(145deg, #4a4a4a, #2a2a2a); }
+ .cover-1 { background: linear-gradient(145deg, #7a7a7a, #555555); }
+ .cover-2 { background: linear-gradient(145deg, #606060, #3a3a3a); }
+
+ .book-info { flex: 1; min-width: 0; }
+ .book-title {
+  font-family: var(--serif);
+  font-size: 14.5px; font-weight: 400;
+  line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+ }
+ .book-meta {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 5px;
+  font-size: 12px; color: var(--ink-light);
+  flex-wrap: wrap;
+ }
+ .book-meta span, .book-meta a { white-space: nowrap; }
+ .book-meta a { color: var(--ink-light); text-decoration: none; }
+ .book-meta a:hover { color: var(--ink); text-decoration: underline; }
+
+ .progress-bar {
+  width: 64px; height: 4px;
+  background: var(--border);
+  border-radius: 2px; overflow: hidden;
+ }
+ .progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.4s ease;
+ }
+
+ .book-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+ /* Buttons */
+ .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-family: var(--sans);
+  font-size: 13px; font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition);
+  text-decoration: none;
+ }
+ .btn-icon {
+  width: 32px; height: 32px; padding: 0;
+  background: transparent; color: var(--ink-light);
+  border-radius: 8px;
+ }
+ .btn-icon:hover { background: var(--border-light); color: var(--ink); }
+ .btn-icon svg { width: 16px; height: 16px; }
+ .btn-icon.danger:hover { background: var(--red-soft); color: var(--red); }
+
+ .btn-primary {
+  padding: 10px 20px;
+  background: var(--accent); color: white;
+  font-weight: 600;
+ }
+ .btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+ .btn-primary:active { transform: translateY(0); }
+
+ .btn-secondary {
+  padding: 6px 12px;
+  background: transparent; color: var(--ink-light);
+  border: 1px solid var(--border);
+  font-size: 12px;
+ }
+ .btn-secondary:hover { border-color: var(--ink-faint); color: var(--ink); }
+
+ /* Inline editor (per-book position edit) */
+ .editor {
+  margin-top: 8px; padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px;
+ }
+ .editor input { width: 56px; }
+
+ /* Upload zone */
+ .upload-zone {
+  padding: 28px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: all var(--transition);
+  position: relative;
+ }
+ .upload-zone:hover, .upload-zone.dragover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+ }
+ .upload-zone.dragover { transform: scale(1.01); }
+ .upload-zone input[type="file"] {
+  position: absolute; inset: 0; opacity: 0; cursor: pointer;
+ }
+ .upload-icon {
+  width: 40px; height: 40px;
+  border-radius: 10px;
+  background: var(--accent-soft);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+ }
+ .upload-icon svg { width: 20px; height: 20px; }
+ .upload-text { font-size: 14px; color: var(--ink-light); text-align: center; }
+ .upload-text strong { color: var(--accent); font-weight: 500; }
+ .upload-status { margin-top: 8px; font-size: 12px; color: var(--ink-light); text-align: center; min-height: 1em; }
+
+ /* Settings */
+ .settings-grid { padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+ .setting-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+ .setting-label { font-size: 13.5px; color: var(--ink); }
+ .setting-label small { display: block; font-size: 12px; color: var(--ink-faint); margin-top: 2px; }
+
+ select, input[type="number"], input[type="text"] {
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--ink);
+  outline: none;
+  transition: border-color var(--transition);
+  -webkit-appearance: none;
+ }
+ select {
+  padding-right: 32px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%237a6e64' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+ }
+ input[type="number"] { width: 72px; text-align: center; }
+ select:focus, input:focus { border-color: var(--accent); }
+
+ .settings-footer { padding: 0 18px 18px; display: flex; justify-content: flex-end; align-items: center; gap: 12px; }
+ .settings-footer .status { flex: 1; font-size: 12px; color: var(--ink-light); }
+
+ /* Todo */
+ .todo-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 18px;
+  transition: background var(--transition);
+ }
+ .todo-item:hover { background: var(--bg-hover); }
+ .todo-item + .todo-item { border-top: 1px solid var(--border-light); }
+ .todo-check {
+  -webkit-appearance: none; appearance: none;
+  width: 20px; height: 20px;
+  border: 2px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer; flex-shrink: 0;
+  transition: all var(--transition);
+  position: relative; background: transparent;
+ }
+ .todo-check:checked { background: var(--accent); border-color: var(--accent); }
+ .todo-check:checked::after {
+  content: ''; position: absolute;
+  left: 5px; top: 2px;
+  width: 6px; height: 10px;
+  border: solid white; border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+ }
+ .todo-text { flex: 1; font-size: 14px; line-height: 1.4; }
+ .todo-text.done { text-decoration: line-through; color: var(--ink-faint); }
+ .todo-add {
+  display: flex; gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border-light);
+ }
+ .todo-add input[type="text"] { flex: 1; padding: 10px 14px; }
+
+ .empty-state {
+  padding: 32px 18px;
+  text-align: center;
+  color: var(--ink-faint);
+  font-size: 13px;
+ }
+
+ @keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+ }
+ section { animation: fadeUp 0.5s ease both; }
+ section:nth-child(2) { animation-delay: 0.05s; }
+ section:nth-child(3) { animation-delay: 0.10s; }
+ section:nth-child(4) { animation-delay: 0.15s; }
+ section:nth-child(5) { animation-delay: 0.20s; }
+
+ @media (max-width: 480px) {
+  .container { padding: 20px 16px 60px; }
+  header h1 { font-size: 19px; }
+  .book-item { padding: 14px; gap: 12px; }
+  .book-meta { flex-wrap: wrap; gap: 8px; }
+ }
+</style>
+</head>
+<body>
+<div class="container">
+ <header>
+  <div class="logo">
+   <svg viewBox="0 0 90 80" fill="none" stroke="currentColor" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M45 4 L48 14 L58 16 L48 18 L45 28 L42 18 L32 16 L42 14 Z"
+          fill="currentColor" stroke-width="2"/>
+    <path d="M8 32 L45 42 L45 74 L8 64 Z"/>
+    <path d="M82 32 L45 42 L45 74 L82 64 Z"/>
+   </svg>
+  </div>
+  <h1>tiny-reader</h1>
+ </header>
+
+ <section>
+  <div class="section-label">Library</div>
+  <div class="card" id="books"><div class="empty-state">loading...</div></div>
+ </section>
+
+ <section>
+  <div class="section-label">Upload</div>
+  <form id="up" onsubmit="upload(event)">
+   <div class="upload-zone" id="dropZone">
+    <input type="file" name="file" accept=".epub" id="fileInput" required/>
+    <div class="upload-icon">
+     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+      <polyline points="17 8 12 3 7 8"/>
+      <line x1="12" x2="12" y1="3" y2="15"/>
+     </svg>
+    </div>
+    <div class="upload-text">
+     <strong>Choose file</strong> or drag &amp; drop<br>
+     <span style="font-size:12px;color:var(--ink-faint)">.epub files only</span>
+    </div>
+   </div>
+   <div class="upload-status" id="status"></div>
+  </form>
+ </section>
+
+ <section>
+  <div class="section-label">Settings</div>
+  <form id="sf" onsubmit="saveSettings(event)">
+   <div class="card">
+    <div class="settings-grid">
+     <div class="setting-row">
+      <div class="setting-label">
+       Text density
+       <small>Adjusts text per page</small>
+      </div>
+      <select name="density" id="density">
+       <option value="0">Compact</option>
+       <option value="1">Medium</option>
+       <option value="2">Loose</option>
+      </select>
+     </div>
+     <div class="setting-row">
+      <div class="setting-label">
+       WiFi auto-exit
+       <small>Minutes idle before disconnect</small>
+      </div>
+      <input type="number" name="ap_idle_minutes" id="apidle" min="1" max="120" value="30">
+     </div>
+    </div>
+    <div class="settings-footer">
+     <div class="status" id="settings_status"></div>
+     <button type="submit" class="btn btn-primary">Save settings</button>
+    </div>
+   </div>
+  </form>
+ </section>
+
+ <section>
+  <div class="section-label">Todo</div>
+  <div class="card">
+   <div id="todos"><div class="empty-state">loading...</div></div>
+   <form id="tf" onsubmit="addTodo(event)" class="todo-add">
+    <input type="text" id="todo_text" maxlength="200" placeholder="Add a new item..." required/>
+    <button type="submit" class="btn btn-primary" style="padding:10px 16px;">Add</button>
+   </form>
+   <div id="todo_status" class="upload-status" style="padding:0 18px 12px"></div>
+  </div>
+ </section>
+</div>
+
+<script>
+ var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
+ var jsq=function(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");};
+ // SVG icons reused in book-actions
+ var ICON_DL='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>';
+ var ICON_EDIT='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
+ var ICON_TRASH='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>';
+ var ICON_X='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" x2="6" y1="6" y2="18"/><line x1="6" x2="18" y1="6" y2="18"/></svg>';
+
+ var firstLetter=function(s){
+  for(var i=0;i<s.length;i++){var c=s.charAt(i).toUpperCase();
+   if(c>='A'&&c<='Z'||c>='0'&&c<='9') return c;}
+  return '?';
+ };
+ var coverClass=function(name){
+  var h=0; for(var i=0;i<name.length;i++) h=(h*31+name.charCodeAt(i))|0;
+  return 'cover-'+(Math.abs(h)%3);
+ };
+
+ var load=function(){
+  fetch('/api/books').then(function(r){return r.json();}).then(function(list){
+   var d=document.getElementById('books');
+   if(!list.length){d.innerHTML='<div class=empty-state>(empty)</div>';return;}
+   d.innerHTML=list.map(function(b){
+    var nameNoExt=b.name.replace(/\.epub$/i,'');
+    var pct = b.hasPos? b.percent : 0;
+    var posLabel = b.hasPos
+        ? '<span>ch '+(b.spine+1)+', p. '+(b.page+1)+'</span>'
+        : '<span>not started</span>';
+    var pctLabel = b.hasPos? '<span>'+pct+'%</span>' : '';
+    return '<div class="book-item">'+
+      '<div class="book-cover '+coverClass(b.name)+'">'+firstLetter(nameNoExt)+'</div>'+
+      '<div class="book-info">'+
+       '<div class="book-title">'+esc(nameNoExt)+'</div>'+
+       '<div class="book-meta">'+
+        '<div class="progress-bar"><div class="progress-fill" style="width:'+pct+'%"></div></div>'+
+        pctLabel+
+        posLabel+
+        '<span>'+(b.size/1024).toFixed(0)+' KB</span>'+
+       '</div>'+
+       '<div class="editor" id="ed-'+esc(b.name)+'" style="display:none"></div>'+
+      '</div>'+
+      '<div class="book-actions">'+
+       '<a href="/api/books/'+encodeURIComponent(b.name)+'" download class="btn btn-icon" title="Download">'+ICON_DL+'</a>'+
+       '<button type=button class="btn btn-icon" title="Edit position" onclick="editPos(\''+jsq(b.name)+'\','+b.spine+','+b.page+')">'+ICON_EDIT+'</button>'+
+       '<button type=button class="btn btn-icon danger" title="Delete" onclick="del(\''+jsq(b.name)+'\')">'+ICON_TRASH+'</button>'+
+      '</div>'+
+     '</div>';
+   }).join('');
+  });
+ };
+
+ var editPos=function(name,sp,pg){
+  var ed=document.querySelector('#ed-'+CSS.escape(name));
+  ed.style.display='flex';
+  ed.innerHTML='chapter <input type=number id=sp value='+(sp+1)+' min=1> page <input type=number id=pg value='+(pg+1)+' min=1> '+
+   '<button type=button class="btn btn-secondary" onclick="savePos(\''+jsq(name)+'\')">save</button>'+
+   '<button type=button class="btn btn-secondary" onclick="cancelPos(\''+jsq(name)+'\')">cancel</button>';
+ };
+ var cancelPos=function(name){
+  var ed=document.querySelector('#ed-'+CSS.escape(name));
+  ed.style.display='none'; ed.innerHTML='';
+ };
+ var savePos=function(name){
+  var ed=document.querySelector('#ed-'+CSS.escape(name));
+  var sp=Math.max(0,parseInt(ed.querySelector('#sp').value,10)-1);
+  var pg=Math.max(0,parseInt(ed.querySelector('#pg').value,10)-1);
+  var fd=new URLSearchParams(); fd.append('spine',sp); fd.append('page',pg);
+  fetch('/api/books/'+encodeURIComponent(name)+'/pos',
+        {method:'POST',body:fd,headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){if(r.ok){load();}else{alert('save failed');}});
+ };
+
+ var upload=function(e){
+  e.preventDefault();
+  var st=document.getElementById('status');
+  var f=document.getElementById('fileInput').files[0]; if(!f) return;
+  var CHUNK=32*1024;
+  var totalKB=(f.size/1024).toFixed(0);
+  var postChunk=function(url,body,attempt){
+   attempt=attempt||1;
+   var ctrl=new AbortController();
+   var t=setTimeout(function(){ctrl.abort();},15000);
+   return fetch(url,{method:'POST',body:body,
+                     headers:{'Content-Type':'application/octet-stream'},
+                     signal:ctrl.signal})
+    .then(function(r){clearTimeout(t); if(!r.ok) throw new Error('HTTP '+r.status); return r;})
+    .catch(function(err){
+     clearTimeout(t);
+     if(attempt<3){
+      st.textContent='retry '+attempt+' ('+err.message+')';
+      return new Promise(function(res){setTimeout(res,500*attempt);})
+              .then(function(){return postChunk(url,body,attempt+1);});
+     }
+     throw err;
+    });
+  };
+  var sendNext=function(offset){
+   if(offset>=f.size){
+    postChunk('/api/upload_chunk?name='+encodeURIComponent(f.name)+'&offset='+f.size+'&final=1',new Blob([]))
+     .then(function(){ st.textContent='done '+totalKB+' KB'; load(); })
+     .catch(function(err){ st.textContent='final marker failed: '+err.message; });
+    return;
+   }
+   var endOff=Math.min(offset+CHUNK,f.size);
+   var chunk=f.slice(offset,endOff);
+   var pct=((endOff/f.size)*100).toFixed(0);
+   st.textContent='uploading '+pct+'% ('+(endOff/1024).toFixed(0)+'/'+totalKB+' KB)';
+   postChunk('/api/upload_chunk?name='+encodeURIComponent(f.name)+'&offset='+offset,chunk)
+    .then(function(){ setTimeout(function(){sendNext(endOff);},50); })
+    .catch(function(err){ st.textContent='upload failed @ '+offset+': '+err.message; });
+  };
+  sendNext(0);
+ };
+
+ // File-input change kicks off the upload form (drag-drop too: input's
+ // 'change' fires when files are dropped into the file input itself).
+ document.getElementById('fileInput').addEventListener('change',function(){
+  if(this.files && this.files[0]) document.getElementById('up').requestSubmit();
+ });
+ // Visual drag-over state on the zone.
+ var zone=document.getElementById('dropZone');
+ zone.addEventListener('dragover',function(e){e.preventDefault(); zone.classList.add('dragover');});
+ zone.addEventListener('dragleave',function(){zone.classList.remove('dragover');});
+ zone.addEventListener('drop',function(){zone.classList.remove('dragover');});
+
+ var del=function(n){
+  if(!confirm('delete '+n+'?')) return;
+  fetch('/api/books/'+encodeURIComponent(n),{method:'DELETE'}).then(function(r){
+   if(r.ok) load(); else alert('delete failed');
+  });
+ };
+
+ var loadSettings=function(){
+  fetch('/api/settings').then(function(r){return r.json();}).then(function(s){
+   document.getElementById('density').value=s.density;
+   document.getElementById('apidle').value=s.ap_idle_minutes;
+  });
+ };
+ var saveSettings=function(e){
+  e.preventDefault();
+  var st=document.getElementById('settings_status');
+  var fd=new URLSearchParams();
+  fd.append('density',document.getElementById('density').value);
+  fd.append('ap_idle_minutes',document.getElementById('apidle').value);
+  st.textContent='saving...';
+  fetch('/api/settings',{method:'POST',body:fd,
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+   })
+   .then(function(j){
+    st.textContent=j.changed? 'saved (applies on next book open)'
+                            : 'saved';
+   })
+   .catch(function(err){st.textContent='save failed: '+err.message;});
+ };
+
+ var todoState=[];
+ var renderTodos=function(){
+  var d=document.getElementById('todos');
+  if(!todoState.length){d.innerHTML='<div class=empty-state>(empty)</div>';return;}
+  d.innerHTML=todoState.map(function(it,i){
+   var checked=it.done?' checked':'';
+   return '<label class="todo-item">'+
+    '<input type=checkbox class=todo-check data-i='+i+' onchange="toggleTodo('+i+')"'+checked+'>'+
+    '<span class="todo-text'+(it.done?' done':'')+'">'+esc(it.text)+'</span>'+
+    '<button type=button class="btn btn-icon danger" title="Delete" onclick="delTodo('+i+')">'+ICON_X+'</button>'+
+   '</label>';
+  }).join('');
+ };
+ var loadTodos=function(){
+  fetch('/api/todos').then(function(r){return r.json();}).then(function(j){
+   todoState=(j&&j.items)?j.items:[];
+   renderTodos();
+  });
+ };
+ var saveTodos=function(){
+  var st=document.getElementById('todo_status');
+  var fd=new URLSearchParams();
+  fd.append('items',JSON.stringify(todoState));
+  st.textContent='saving...';
+  fetch('/api/todos',{method:'POST',body:fd,
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){
+    if(!r.ok) return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});
+    return r.json();
+   })
+   .then(function(){st.textContent='saved';})
+   .catch(function(err){st.textContent='save failed: '+err.message;loadTodos();});
+ };
+ var addTodo=function(e){
+  e.preventDefault();
+  var input=document.getElementById('todo_text');
+  var t=(input.value||'').trim();
+  if(!t) return;
+  if(t.length>200){document.getElementById('todo_status').textContent='item too long (max 200 chars)';return;}
+  if(todoState.length>=50){document.getElementById('todo_status').textContent='max 50 items';return;}
+  todoState.push({text:t,done:false});
+  input.value='';
+  renderTodos();
+  saveTodos();
+ };
+ var toggleTodo=function(i){
+  if(i<0||i>=todoState.length) return;
+  todoState[i].done=!todoState[i].done;
+  renderTodos();
+  saveTodos();
+ };
+ var delTodo=function(i){
+  if(i<0||i>=todoState.length) return;
+  todoState.splice(i,1);
+  renderTodos();
+  saveTodos();
+ };
+
+ load(); loadSettings(); loadTodos();
+</script>
+</body>
+</html>
+)TINYREADER";
