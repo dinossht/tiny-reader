@@ -129,8 +129,19 @@ static void apply_density() {
             book_chars_per_line = 44;
             break;
     }
-    book_lines_per_page =
-        (EPD_HEIGHT - BOOK_TOP_RESERVE - BOOK_FOOTER_RESERVE) / book_line_height;
+    // Lines per page = (max baseline range) / line_height + 1.
+    // First line's baseline sits at BOOK_TOP_RESERVE+30 (matches the y0
+    // passed to render_book_page_text). Last line's baseline must leave
+    // ~10 px of descender slack above the footer reserve. The previous
+    // formula treated the available area as N×line_height bands and
+    // truncated, which lost a usable line in compact mode.
+    {
+        const int first_baseline = BOOK_TOP_RESERVE + 30;
+        const int last_baseline_max =
+            EPD_HEIGHT - BOOK_FOOTER_RESERVE - 10;
+        book_lines_per_page =
+            (last_baseline_max - first_baseline) / book_line_height + 1;
+    }
     Serial.printf("[SETTINGS] density=%d -> line_h=%d lines/page=%d chars/line=%d\n",
                   g_settings.density, book_line_height,
                   book_lines_per_page, book_chars_per_line);
