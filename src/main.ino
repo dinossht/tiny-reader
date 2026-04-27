@@ -70,7 +70,7 @@ static AppMode app_mode = MODE_LIBRARY;
 static std::vector<std::string> books;   // filenames in SD root ending .epub
 static int selected = 0;                 // index in books
 static int page_first = 0;               // first index visible on the screen
-static const int LINES_PER_PAGE = 4;     // taller rows for cover thumbnails (~96 px each)
+static const int LINES_PER_PAGE = 5;     // 64-px rows fit 5 above the corner-icon button
 static const int LINE_HEIGHT = 56;
 static const int LIST_X = 60;
 static const int LIST_Y = 80;
@@ -740,10 +740,14 @@ static int tjpg_output_cb(JDEC *jd, void *bitmap, JRECT *rect) {
 static bool decode_cover_jpeg(const uint8_t *jpeg, size_t jpeg_size,
                               uint8_t *thumb_4bit) {
     JDEC jd;
-    void *workbuf = ps_malloc(3100);
+    // 3100 is tjpgd's documented minimum for plain baseline JPEGs but real
+    // EPUB covers (especially progressive or larger) need much more.
+    // atomic14's reader uses 64 KB; we have 8 MB PSRAM, so use the same.
+    const size_t WORKBUF_SIZE = 64 * 1024;
+    void *workbuf = ps_malloc(WORKBUF_SIZE);
     if (!workbuf) return false;
     TjpgCtx ctx = {jpeg, jpeg_size, 0, nullptr, 0, 0};
-    JRESULT r = jd_prepare(&jd, tjpg_input_cb, workbuf, 3100, &ctx);
+    JRESULT r = jd_prepare(&jd, tjpg_input_cb, workbuf, WORKBUF_SIZE, &ctx);
     if (r != JDR_OK) {
         Serial.printf("[THUMB] jd_prepare failed: %d\n", r);
         free(workbuf);
@@ -788,12 +792,34 @@ static void generate_thumb_if_missing(Epub &epub, const std::string &book_path) 
     std::string fname = (slash != std::string::npos)
                         ? book_path.substr(slash + 1) : book_path;
     String thumb_path = thumb_path_for_name(String(fname.c_str()));
-    if (SD.exists(thumb_path)) return;
+    if (SD.exists(thumb_path)) {
+        File chk = SD.open(thumb_path, FILE_READ);
+        long sz = chk ? chk.size() : 0;
+        if (chk) chk.close();
+        if (sz == (long)THUMB_BYTES) {
+            Serial.printf("[THUMB] %s already cached\n", thumb_path.c_str());
+            return;
+        }
+        // Stale cache from an older thumb size — wipe and regenerate.
+        Serial.printf("[THUMB] %s stale (%ld vs %u), regenerating\n",
+                      thumb_path.c_str(), sz, (unsigned)THUMB_BYTES);
+        SD.remove(thumb_path);
+    }
     const std::string &cover_href = epub.get_cover_image_item();
-    if (cover_href.empty()) return;
+    if (cover_href.empty()) {
+        Serial.printf("[THUMB] %s: no cover in manifest\n", fname.c_str());
+        return;
+    }
+    Serial.printf("[THUMB] %s: cover='%s'\n", fname.c_str(), cover_href.c_str());
     size_t size = 0;
     uint8_t *data = epub.get_item_contents(cover_href, &size);
-    if (!data || size == 0) { if (data) free(data); return; }
+    if (!data || size == 0) {
+        if (data) free(data);
+        Serial.printf("[THUMB] %s: read cover bytes failed\n", fname.c_str());
+        return;
+    }
+    Serial.printf("[THUMB] %s: cover %u bytes, decoding...\n",
+                  fname.c_str(), (unsigned)size);
     uint8_t *thumb = (uint8_t *)heap_caps_malloc(THUMB_BYTES, MALLOC_CAP_8BIT);
     if (!thumb) { free(data); return; }
     bool ok = decode_cover_jpeg(data, size, thumb);
@@ -804,9 +830,12 @@ static void generate_thumb_if_missing(Epub &epub, const std::string &book_path) 
             f.write(thumb, THUMB_BYTES);
             f.close();
             Serial.printf("[THUMB] cached %s\n", thumb_path.c_str());
+        } else {
+            Serial.printf("[THUMB] %s: SD write failed\n", thumb_path.c_str());
         }
     } else {
-        Serial.printf("[THUMB] decode failed for %s\n", fname.c_str());
+        Serial.printf("[THUMB] %s: decode failed (likely PNG cover or "
+                      "unsupported JPEG variant)\n", fname.c_str());
     }
     free(thumb);
 }
@@ -1800,14 +1829,18 @@ static void render_book_list() {
         writeln(small, "3. Open http://192.168.4.1 and upload .epub files.",
                 &cx, &cy, framebuffer);
     } else {
-        // Layout per row: cover thumbnail on the left, then cursor + title,
-        // then state indicator on the right. Rows are ~96 px tall to fit
-        // the THUMB_H thumbnail without crowding.
+        // Per-row layout: small cover thumb on the left, cursor + title,
+        // state indicator on the right. Cache is full-resolution
+        // (THUMB_W × THUMB_H), but we render it at half size in the
+        // library so rows stay compact (taller rows are reserved for
+        // the deep-sleep screensaver, which uses the full thumb upscaled).
         const int BAR_H = 12;
         const int RIGHT_X = EPD_WIDTH - LIST_X;
         const int PILL_SIZE = 18;
-        const int LIB_ROW_HEIGHT = 96;
-        const int TEXT_LEFT = LIST_X + THUMB_W + 24;  // start of cursor+title
+        const int LIB_THUMB_W = THUMB_W / 2;       // 40
+        const int LIB_THUMB_H = THUMB_H / 2;       // 55
+        const int LIB_ROW_HEIGHT = 64;
+        const int TEXT_LEFT = LIST_X + LIB_THUMB_W + 24;
 
         int row = 0;
         for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
@@ -1815,21 +1848,21 @@ static void render_book_list() {
             int32_t baseline = LIST_Y + 110 + row * LIB_ROW_HEIGHT;
 
             // Cover thumbnail (cached 4-bit raw on SD as <bookname>.thumb).
-            // If the thumb file is missing we just leave the slot blank;
-            // the next time the book is opened, chapter_load_task will
-            // generate one and it'll appear on the next library render.
+            // Blit at 1/2 scale by sampling every 2nd pixel.
             String thumb_path = thumb_path_for_name(String(books[i].c_str()));
             File tf = SD.open(thumb_path, FILE_READ);
-            int thumb_top = baseline - THUMB_H + 14;   // bottom-aligned to row
+            int thumb_top = baseline - LIB_THUMB_H + 8;   // align with row baseline
             if (tf && tf.size() == (long)THUMB_BYTES) {
                 static uint8_t thumb_buf[THUMB_BYTES];
                 tf.read(thumb_buf, THUMB_BYTES);
                 tf.close();
-                for (int y = 0; y < THUMB_H; ++y) {
-                    for (int x = 0; x < THUMB_W; ++x) {
-                        int idx = (y * THUMB_W + x) / 2;
-                        uint8_t nib = (x & 1) ? (thumb_buf[idx] >> 4)
-                                              : (thumb_buf[idx] & 0x0F);
+                for (int y = 0; y < LIB_THUMB_H; ++y) {
+                    int sy = y * 2;
+                    for (int x = 0; x < LIB_THUMB_W; ++x) {
+                        int sx = x * 2;
+                        int idx = (sy * THUMB_W + sx) / 2;
+                        uint8_t nib = (sx & 1) ? (thumb_buf[idx] >> 4)
+                                               : (thumb_buf[idx] & 0x0F);
                         int dx = LIST_X + x, dy = thumb_top + y;
                         if (dx < 0 || dx >= EPD_WIDTH ||
                             dy < 0 || dy >= EPD_HEIGHT) continue;
@@ -1846,11 +1879,13 @@ static void render_book_list() {
                 tf.close();
             }
 
-            // Cursor sprite (filled triangle) + title.
+            // Cursor sprite (filled triangle) + title. The right edge of
+            // the title must clear the right-side state column (time
+            // estimate + progress bar = ~190 px before RIGHT_X).
             std::string title = books[i];
             size_t dot = title.rfind(".epub");
             if (dot != std::string::npos) title.erase(dot);
-            if (title.size() > 32) title = title.substr(0, 29) + "...";
+            if (title.size() > 28) title = title.substr(0, 25) + "...";
             if (sel) {
                 draw_selection_marker(TEXT_LEFT, baseline - 28, 24, framebuffer);
             }
@@ -2256,6 +2291,11 @@ static String ap_password;
 static uint32_t ap_last_activity = 0;
 // Computed at AP entry from g_settings.ap_idle_minutes.
 static uint32_t ap_idle_timeout_ms = 5UL * 60UL * 1000UL;
+// Set by the WiFi event handler when a station connects/disconnects, consumed
+// by loop() so the (slow) screen redraw runs on the main task, not from the
+// WiFi event callback.
+static volatile bool g_ap_clients_changed = false;
+static bool g_ap_has_client = false;
 static File ap_upload_file;
 
 static const char *AP_SSID_FIXED = "tiny-reader";
@@ -2318,16 +2358,57 @@ static void render_ap_screen() {
     int32_t cx = 60 + (LOGO_W / 2) + 24, cy = 110;
     writeln((GFXfont *)&freesans_title, "tiny-reader", &cx, &cy, framebuffer);
 
-    // Single-line SSID + URL.
+    // SSID + URL on the left, WiFi-credentials QR on the right. Scanning
+    // the QR makes the phone join the AP automatically; then the user
+    // opens the URL in a browser.
     char line[200];
     cx = 60; cy = 240;
     snprintf(line, sizeof(line), "Connect to WiFi: %s", ap_ssid.c_str());
     writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
 
     cx = 60; cy = 340;
-    snprintf(line, sizeof(line), "Open in browser: http://%s",
+    writeln((GFXfont *)&FiraSans, "Open in browser:", &cx, &cy, framebuffer);
+    cx = 60; cy = 400;
+    snprintf(line, sizeof(line), "http://%s",
              WiFi.softAPIP().toString().c_str());
     writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
+
+    // QR (132×132 source, 2× upscale → 264×264) on the right.
+    const int qr_scale = 2;
+    int qr_w = QR_WIFI_W * qr_scale;
+    int qr_h = QR_WIFI_H * qr_scale;
+    int qr_x = EPD_WIDTH - qr_w - 60;
+    int qr_y = (EPD_HEIGHT - qr_h) / 2;
+    {
+        int row_bytes = (QR_WIFI_W + 7) / 8;
+        for (int y = 0; y < QR_WIFI_H; ++y) {
+            for (int x = 0; x < QR_WIFI_W; ++x) {
+                if (!(QR_WIFI_BITMAP[y * row_bytes + (x >> 3)] &
+                      (0x80 >> (x & 7)))) continue;
+                for (int dy = 0; dy < qr_scale; ++dy)
+                    for (int dx = 0; dx < qr_scale; ++dx) {
+                        int px = qr_x + x * qr_scale + dx;
+                        int py = qr_y + y * qr_scale + dy;
+                        if (px < 0 || px >= EPD_WIDTH ||
+                            py < 0 || py >= EPD_HEIGHT) continue;
+                        int idx = (py * EPD_WIDTH + px) / 2;
+                        framebuffer[idx] &= (px & 1) ? 0x0F : 0xF0;
+                    }
+            }
+        }
+    }
+
+    // Small "Connected" label centered under the QR — only when a station
+    // is currently associated. Nothing shown when waiting.
+    if (g_ap_has_client) {
+        const GFXfont *small = (GFXfont *)&firasans_small;
+        const char *msg = "Connected";
+        int32_t bx = 0, by = 0, bx1 = 0, by1 = 0, bw = 0, bh = 0;
+        get_text_bounds(small, msg, &bx, &by, &bx1, &by1, &bw, &bh, nullptr);
+        int32_t lx = qr_x + (qr_w - bw) / 2;
+        int32_t ly = qr_y + qr_h + 36;
+        writeln(small, msg, &lx, &ly, framebuffer);
+    }
 
     flush_framebuffer(/*force_full=*/true);
 }
@@ -2623,8 +2704,14 @@ static uint32_t ap_started_at = 0;
 static void on_wifi_event(WiFiEvent_t event, WiFiEventInfo_t info) {
     switch (event) {
         case ARDUINO_EVENT_WIFI_AP_START:        Serial.println("[WIFI] AP_START"); break;
-        case ARDUINO_EVENT_WIFI_AP_STACONNECTED: Serial.println("[WIFI] STA connected"); break;
-        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:Serial.println("[WIFI] STA disconnected"); break;
+        case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+            Serial.println("[WIFI] STA connected");
+            g_ap_clients_changed = true;
+            break;
+        case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+            Serial.println("[WIFI] STA disconnected");
+            g_ap_clients_changed = true;
+            break;
         case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:Serial.println("[WIFI] STA got IP"); break;
         default: break;
     }
@@ -2721,6 +2808,8 @@ static void enter_ap_mode() {
     ap_last_activity = millis();
     ap_started_at = millis();
     ap_idle_timeout_ms = (uint32_t)g_settings.ap_idle_minutes * 60UL * 1000UL;
+    g_ap_has_client = false;
+    g_ap_clients_changed = false;
     Serial.printf("[AP] up: SSID=%s pw=%s ip=%s\n",
                   ap_ssid.c_str(), ap_password.c_str(),
                   WiFi.softAPIP().toString().c_str());
@@ -3117,6 +3206,18 @@ void loop() {
     // ---- AP / web-server mode ----
     if (ap_active) {
         if (dns_server) dns_server->processNextRequest();
+        // Redraw the AP screen when station count flips between 0 and >0.
+        // Event flag is set from the WiFi event task; we read the actual
+        // count here on the main task so the (slow) e-paper redraw doesn't
+        // run inside the WiFi callback.
+        if (g_ap_clients_changed) {
+            g_ap_clients_changed = false;
+            bool has_client = WiFi.softAPgetStationNum() > 0;
+            if (has_client != g_ap_has_client) {
+                g_ap_has_client = has_client;
+                render_ap_screen();
+            }
+        }
         // AsyncWebServer runs its own task; no handleClient() needed.
         // Idle/upload-fresh checks are wrap-safe: ap_last_activity and
         // g_chunk_last_ms are written by AsyncTCP-task callbacks. The

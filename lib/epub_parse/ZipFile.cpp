@@ -1,8 +1,9 @@
 #ifndef UNIT_TEST
 #include <esp_log.h>
 #else
-#define ESP_LOGE(args...)
-#define ESP_LOGI(args...)
+#include <stdio.h>
+#define ESP_LOGE(tag, fmt, ...) do { printf("[ZIP] " fmt "\n", ##__VA_ARGS__); } while (0)
+#define ESP_LOGI(tag, fmt, ...) do { printf("[ZIP] " fmt "\n", ##__VA_ARGS__); } while (0)
 #endif
 #include "ZipFile.h"
 
