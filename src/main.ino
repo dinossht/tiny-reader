@@ -42,13 +42,14 @@
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
 #include <Preferences.h>
+#include <ArduinoJson.h>
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
 static TouchDrvGT911 touch;
 static bool touchOnline = false;
 
-enum AppMode { MODE_LIBRARY, MODE_BOOK };
+enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP, MODE_BOOK_END };
 static AppMode app_mode = MODE_LIBRARY;
 
 // library mode
@@ -180,6 +181,61 @@ static bool save_settings() {
     return true;
 }
 
+// ---- TODO list (backlog #11): hub-managed notes/todo persisted on SD. ----
+// Schema on disk (/todos.json):
+//   {"items":[{"text":"buy milk","done":false}, ...]}
+// Caps: TODOS_MAX_ITEMS items, TODOS_MAX_TEXT bytes per item.
+struct TodoItem { std::string text; bool done; };
+static std::vector<TodoItem> g_todos;
+static const size_t TODOS_MAX_ITEMS = 50;
+static const size_t TODOS_MAX_TEXT  = 200;
+
+static void load_todos() {
+    g_todos.clear();
+    File f = SD.open("/todos.json", FILE_READ);
+    if (!f) {
+        Serial.println("[TODOS] no /todos.json — starting empty");
+        return;
+    }
+    // ArduinoJson v7 uses elastic JsonDocument; size to file length + slack.
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) {
+        Serial.printf("[TODOS] parse failed: %s — starting empty\n", err.c_str());
+        return;
+    }
+    JsonArrayConst items = doc["items"].as<JsonArrayConst>();
+    for (JsonVariantConst v : items) {
+        if (g_todos.size() >= TODOS_MAX_ITEMS) break;
+        const char *t = v["text"] | "";
+        bool d = v["done"] | false;
+        if (!t || !*t) continue;
+        TodoItem it;
+        it.text.assign(t, strnlen(t, TODOS_MAX_TEXT));
+        it.done = d;
+        g_todos.push_back(std::move(it));
+    }
+    Serial.printf("[TODOS] loaded %u item(s)\n", (unsigned)g_todos.size());
+}
+
+static bool save_todos() {
+    JsonDocument doc;
+    JsonArray items = doc["items"].to<JsonArray>();
+    for (const TodoItem &it : g_todos) {
+        JsonObject o = items.add<JsonObject>();
+        o["text"] = it.text;
+        o["done"] = it.done;
+    }
+    File f = SD.open("/todos.json", FILE_WRITE);
+    if (!f) { Serial.println("[TODOS] save failed"); return false; }
+    size_t n = serializeJson(doc, f);
+    f.close();
+    Serial.printf("[TODOS] saved %u item(s), %u bytes\n",
+                  (unsigned)g_todos.size(), (unsigned)n);
+    return true;
+}
+
 static void clear_and_flush() {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
     epd_poweron();
@@ -297,13 +353,23 @@ static std::string strip_xhtml(const char *src, size_t len) {
     return decode_entities(out2);
 }
 
-// Greedy word-wrap to ~book_chars_per_line per line; preserve paragraph breaks.
+// Pixel-width word wrap — measures actual rendered width with the body font
+// so wide chars like M/W don't push lines past the right edge. Preserves
+// paragraph breaks (consecutive \n becomes a blank line in the output).
 static std::vector<std::string> wrap_text(const std::string &text) {
     std::vector<std::string> lines;
+    const int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
+    const GFXfont *font = (const GFXfont *)&FiraSans;
+
+    auto measure = [font](const char *s) -> int {
+        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+        get_text_bounds(font, s, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        return (int)mw;
+    };
+
     std::string para;
     for (size_t i = 0; i <= text.size(); ++i) {
         if (i == text.size() || text[i] == '\n') {
-            // wrap one paragraph
             std::string current;
             std::string word;
             for (size_t j = 0; j <= para.size(); ++j) {
@@ -312,12 +378,14 @@ static std::vector<std::string> wrap_text(const std::string &text) {
                     if (!word.empty()) {
                         if (current.empty()) {
                             current = word;
-                        } else if ((int)(current.size() + 1 + word.size()) <= book_chars_per_line) {
-                            current += ' ';
-                            current += word;
                         } else {
-                            lines.push_back(current);
-                            current = word;
+                            std::string candidate = current + " " + word;
+                            if (measure(candidate.c_str()) <= target_w) {
+                                current = std::move(candidate);
+                            } else {
+                                lines.push_back(current);
+                                current = word;
+                            }
                         }
                         word.clear();
                     }
@@ -326,8 +394,7 @@ static std::vector<std::string> wrap_text(const std::string &text) {
                 }
             }
             if (!current.empty()) lines.push_back(current);
-            // blank line between paragraphs
-            if (i < text.size()) lines.push_back("");
+            if (i < text.size()) lines.push_back("");   // paragraph separator
             para.clear();
         } else {
             para.push_back(text[i]);
@@ -356,6 +423,7 @@ static std::vector<std::string> paginate_lines(const std::vector<std::string> &l
 }
 
 // Result struct + task that loads epub, extracts a specific spine item, paginates.
+struct TocCacheEntry { int spine_index; std::string title; };
 struct ChapterLoadResult {
     volatile bool done;
     bool ok;
@@ -364,6 +432,7 @@ struct ChapterLoadResult {
     std::string path;
     int spine_to_load;
     std::vector<std::string> pages;
+    std::vector<TocCacheEntry> toc;   // spine_index -> chapter title (NCX TOC)
 };
 
 static void chapter_load_task(void *param) {
@@ -373,6 +442,14 @@ static void chapter_load_task(void *param) {
     if (r->ok) {
         r->spine_n = epub.get_spine_items_count();
         r->title = epub.get_title();
+        // Capture the NCX TOC mapping spine -> chapter title.
+        int ntoc = epub.get_toc_items_count();
+        r->toc.reserve(ntoc);
+        for (int i = 0; i < ntoc; ++i) {
+            EpubTocEntry &e = epub.get_toc_item(i);
+            int sp = epub.get_spine_index_for_toc_index(i);
+            if (sp >= 0) r->toc.push_back({sp, e.title});
+        }
         if (r->spine_to_load >= 0 && r->spine_to_load < r->spine_n) {
             std::string href = epub.get_spine_item(r->spine_to_load);
             size_t size = 0;
@@ -382,9 +459,10 @@ static void chapter_load_task(void *param) {
                 free(data);
                 auto lines = wrap_text(text);
                 r->pages = paginate_lines(lines);
-                Serial.printf("chapter %d: %u pages, %u lines, %u bytes\n",
+                Serial.printf("chapter %d: %u pages, %u lines, %u bytes (toc=%u)\n",
                               r->spine_to_load, (unsigned)r->pages.size(),
-                              (unsigned)lines.size(), (unsigned)text.size());
+                              (unsigned)lines.size(), (unsigned)text.size(),
+                              (unsigned)r->toc.size());
             } else {
                 Serial.printf("chapter %d: get_item_contents failed (size=%u)\n",
                               r->spine_to_load, (unsigned)size);
@@ -394,6 +472,24 @@ static void chapter_load_task(void *param) {
     r->done = true;
     vTaskDelete(NULL);
 }
+
+// Cached after the first chapter load, used to label spine items by their
+// real TOC chapter title (e.g. "Chapter Three" instead of "Sec 8/19").
+static std::vector<TocCacheEntry> g_toc_cache;
+
+// Find the latest TOC entry whose spine_index <= cur. Returns "" if none.
+static std::string get_toc_label_for(int cur_spine) {
+    std::string best;
+    int best_si = -1;
+    for (const auto &e : g_toc_cache) {
+        if (e.spine_index <= cur_spine && e.spine_index > best_si) {
+            best = e.title;
+            best_si = e.spine_index;
+        }
+    }
+    return best;
+}
+
 
 // SD path "/<book-without-extension>.pos" for any book by filename.
 static String pos_path_for_name(const String &name) {
@@ -453,6 +549,7 @@ static bool load_chapter(int spine_index) {
     total_spine = r.spine_n;
     current_spine = spine_index;
     current_page_in_chapter = 0;
+    g_toc_cache = std::move(r.toc);   // refresh cache on every chapter load
     // empty chapter (e.g. cover image only) — synthesize a placeholder page so
     // navigation still works.
     if (chapter_pages.empty()) {
@@ -568,6 +665,49 @@ static void draw_hline(int y, int x0, int x1, uint8_t *fb) {
     }
 }
 
+static void draw_vline(int x, int y0, int y1, uint8_t *fb) {
+    if (x < 0 || x >= EPD_WIDTH) return;
+    if (y0 < 0) y0 = 0;
+    if (y1 > EPD_HEIGHT) y1 = EPD_HEIGHT;
+    for (int y = y0; y < y1; ++y) {
+        int idx = (y * EPD_WIDTH + x) / 2;
+        fb[idx] &= (x & 1) ? 0x0F : 0xF0;
+    }
+}
+
+static void fill_rect(int x0, int y0, int x1, int y1, uint8_t *fb) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > EPD_WIDTH) x1 = EPD_WIDTH;
+    if (y1 > EPD_HEIGHT) y1 = EPD_HEIGHT;
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            int idx = (y * EPD_WIDTH + x) / 2;
+            fb[idx] &= (x & 1) ? 0x0F : 0xF0;
+        }
+    }
+}
+
+// Battery-shaped icon: outline rectangle with a small tip on the right and a
+// fill bar proportional to pct. Positioned with x0 at the left edge,
+// vertically centred around y_centre.
+static void draw_battery_icon(int x0, int y_centre, int pct, uint8_t *fb) {
+    const int W = 32, H = 14;
+    int top = y_centre - H / 2;
+    int bot = top + H;
+    int left = x0;
+    int right = left + W;
+    draw_hline(top,     left, right + 1, fb);
+    draw_hline(bot,     left, right + 1, fb);
+    draw_vline(left,    top,  bot + 1,   fb);
+    draw_vline(right,   top,  bot + 1,   fb);
+    // tip bump on the right
+    fill_rect(right + 1, top + 4, right + 5, bot - 3, fb);
+    // fill bar (inset by 2px from outer rect)
+    int max_w = W - 4;
+    int fill_w = (pct < 0 ? 0 : pct > 100 ? 100 : pct) * max_w / 100;
+    if (fill_w > 0) fill_rect(left + 2, top + 2, left + 2 + fill_w, bot - 1, fb);
+}
+
 // Strip the .epub extension from the selected book filename; "Foo.epub" -> "Foo".
 static std::string short_title_for_selected() {
     if (selected < 0 || selected >= (int)books.size()) return "";
@@ -591,22 +731,43 @@ static void render_book_page() {
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
     // 3-column footer rendered in the smaller font so it occupies less vertical
-    // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B]
-    int book_progress_pct = (total_spine > 0)
-        ? (current_spine * 100) / total_spine
-        : 0;
+    // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B].
+    // book_progress_pct counts chapters completed + the fraction of pages read
+    // in the current chapter, so the last page of the last chapter is 100%.
+    int book_progress_pct = 0;
+    if (total_spine > 0 && !chapter_pages.empty()) {
+        int chap_pages = (int)chapter_pages.size();
+        int read_pages = chap_pages * current_spine + (current_page_in_chapter + 1);
+        int total_pages_est = chap_pages * total_spine;
+        if (total_pages_est > 0) {
+            book_progress_pct = (read_pages * 100 + total_pages_est / 2) / total_pages_est;
+            if (book_progress_pct > 100) book_progress_pct = 100;
+        }
+    }
     const GFXfont *small = (const GFXfont *)&firasans_small;
     int32_t footer_y = EPD_HEIGHT - 12;
     // divider just above the footer text
     draw_hline(EPD_HEIGHT - 42, BOOK_MARGIN_X, EPD_WIDTH - BOOK_MARGIN_X, framebuffer);
-    char left[24], center[40], right[24];
-    snprintf(left, sizeof(left), "%d%%", read_battery_percent());
-    snprintf(center, sizeof(center), "Ch %d/%d  -  %d%% read",
-             current_spine + 1, total_spine, book_progress_pct);
+    int batt_pct = read_battery_percent();
+    char left[24], center[80], right[24];
+    snprintf(left, sizeof(left), " %d%%", batt_pct);
+    // Prefer a real TOC chapter title; fall back to spine index if no NCX.
+    std::string toc_label = get_toc_label_for(current_spine);
+    if (!toc_label.empty()) {
+        // Truncate long titles so the footer stays on one line.
+        if (toc_label.size() > 36) toc_label = toc_label.substr(0, 33) + "...";
+        snprintf(center, sizeof(center), "%s  -  %d%% read",
+                 toc_label.c_str(), book_progress_pct);
+    } else {
+        snprintf(center, sizeof(center), "Sec %d/%d  -  %d%% read",
+                 current_spine + 1, total_spine, book_progress_pct);
+    }
     snprintf(right, sizeof(right), "p %d/%d",
              current_page_in_chapter + 1, (int)chapter_pages.size());
 
-    int32_t lx = BOOK_MARGIN_X, ly = footer_y;
+    // Battery icon + percent
+    draw_battery_icon(BOOK_MARGIN_X, footer_y - 9, batt_pct, framebuffer);
+    int32_t lx = BOOK_MARGIN_X + 42, ly = footer_y;
     writeln(small, left, &lx, &ly, framebuffer);
 
     int32_t cw, ch_ = 0, cmx = 0, cmy = 0, cmx1, cmy1;
@@ -632,6 +793,40 @@ static void render_book_page() {
     }
 }
 
+// "You finished the book!" screen shown after the last page. From here a tap
+// goes back to the library; a long button-press still does AP/sleep.
+static void render_book_end() {
+    Serial.println("[BOOK] reached end-of-book");
+    Serial.flush();
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int32_t cx = LIST_X, cy = 200;
+    writeln((GFXfont *)&FiraSans, "You finished the book.",
+            &cx, &cy, framebuffer);
+
+    cx = LIST_X; cy = 280;
+    char info[80];
+    if (selected >= 0 && selected < (int)books.size()) {
+        std::string title = books[selected];
+        size_t dot = title.rfind(".epub");
+        if (dot != std::string::npos) title.erase(dot);
+        if (title.size() > 50) title = title.substr(0, 47) + "...";
+        snprintf(info, sizeof(info), "%s", title.c_str());
+        writeln((GFXfont *)&FiraSans, info, &cx, &cy, framebuffer);
+    }
+
+    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
+    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
+    writeln((GFXfont *)&firasans_small,
+            "tap left = re-read last page    tap anywhere else = library",
+            &fx, &fy, framebuffer);
+
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
+
 // Advance/go-back a page; cross chapter boundaries by loading next/prev spine item.
 static void book_next_page() {
     if (current_page_in_chapter + 1 < (int)chapter_pages.size()) {
@@ -640,6 +835,10 @@ static void book_next_page() {
         save_position();
     } else if (current_spine + 1 < total_spine) {
         if (load_chapter(current_spine + 1)) { render_book_page(); save_position(); }
+    } else {
+        // last page of last chapter — show the end screen
+        app_mode = MODE_BOOK_END;
+        render_book_end();
     }
 }
 
@@ -737,7 +936,7 @@ static void render_book_list() {
     cx = LIST_X;
     cy = EPD_HEIGHT - 50;
     writeln((GFXfont *)&firasans_small,
-            "tap left/right = navigate    tap center = open",
+            "tap left/right = navigate   tap center = open   tap bottom-right = TODO",
             &cx, &cy, framebuffer);
     cx = LIST_X;
     cy = EPD_HEIGHT - 12;
@@ -757,6 +956,169 @@ static void render_book_list() {
         Serial.println("[STR_100] press detected (library post-render)");
         str100_pressed = true;
     }
+}
+
+// Chapter jump: a vertical list of TOC chapter titles. Tap a row to load
+// that chapter (using its real spine_index from the NCX) and return to
+// MODE_BOOK. Tap top edge cancels. Falls back to a numeric grid if the
+// book has no NCX TOC.
+static const int CJ_ROW_HEIGHT = 50;
+static const int CJ_ROWS_PER_PAGE = 7;   // 8 caused the last row's descender
+                                         // to clip into the footer divider
+static int cj_first = 0;   // first TOC entry shown (for paging if > 8)
+
+static void render_chapter_jump() {
+    Serial.printf("render_chapter_jump: cur_spine=%d toc=%u\n",
+                  current_spine, (unsigned)g_toc_cache.size());
+    Serial.flush();
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int32_t hx = LIST_X, hy = LIST_Y;
+    char header[80];
+    snprintf(header, sizeof(header), "Jump to chapter  (%u in TOC)",
+             (unsigned)g_toc_cache.size());
+    writeln((GFXfont *)&FiraSans, header, &hx, &hy, framebuffer);
+
+    // Compute "current TOC entry" = largest spine_index <= current_spine
+    int cur_toc = -1, best_si = -1;
+    for (size_t i = 0; i < g_toc_cache.size(); ++i) {
+        if (g_toc_cache[i].spine_index <= current_spine &&
+            g_toc_cache[i].spine_index > best_si) {
+            best_si = g_toc_cache[i].spine_index;
+            cur_toc = (int)i;
+        }
+    }
+
+    if (g_toc_cache.empty()) {
+        int32_t cx = LIST_X, cy = LIST_Y + 120;
+        writeln((GFXfont *)&FiraSans,
+                "This book has no TOC.",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy = LIST_Y + 180;
+        writeln((GFXfont *)&FiraSans,
+                "Use left/right page taps to navigate.",
+                &cx, &cy, framebuffer);
+    } else {
+        int total = (int)g_toc_cache.size();
+        int total_pages = (total + CJ_ROWS_PER_PAGE - 1) / CJ_ROWS_PER_PAGE;
+        int cur_page = cj_first / CJ_ROWS_PER_PAGE;
+        if (total_pages > 1) {
+            char pg[32];
+            snprintf(pg, sizeof(pg), "page %d/%d", cur_page + 1, total_pages);
+            int32_t pgx = EPD_WIDTH - 220, pgy = LIST_Y;
+            writeln((GFXfont *)&FiraSans, pg, &pgx, &pgy, framebuffer);
+        }
+
+        int rows_shown = (CJ_ROWS_PER_PAGE < total - cj_first)
+                       ? CJ_ROWS_PER_PAGE : (total - cj_first);
+        for (int row = 0; row < rows_shown; ++row) {
+            int idx = cj_first + row;
+            int32_t cx = LIST_X + 40;
+            int32_t cy = LIST_Y + 60 + row * CJ_ROW_HEIGHT;
+            const char *prefix = (idx == cur_toc) ? "> " : "  ";
+            std::string title = g_toc_cache[idx].title;
+            if (title.empty()) title = "(untitled)";
+            if (title.size() > 50) title = title.substr(0, 47) + "...";
+            std::string line = std::string(prefix) + title;
+            writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
+        }
+    }
+
+    // Footer hint
+    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
+    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
+    writeln((GFXfont *)&firasans_small,
+            "tap a row to jump   -   tap top-left/right to page   -   tap top-center to cancel",
+            &fx, &fy, framebuffer);
+
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
+
+// Returns the spine_index to jump to, or -1 if the tap missed every row.
+static int chapter_jump_hit_test(int16_t x, int16_t y) {
+    if (g_toc_cache.empty()) return -1;
+    int screen_y = EPD_HEIGHT - 1 - y;
+    int rows_top = LIST_Y + 60 - 30;   // first row is ascender-above-baseline
+    int rows_bot = rows_top + CJ_ROWS_PER_PAGE * CJ_ROW_HEIGHT;
+    if (screen_y < rows_top || screen_y >= rows_bot) return -1;
+    int row = (screen_y - rows_top) / CJ_ROW_HEIGHT;
+    int idx = cj_first + row;
+    if (idx < 0 || idx >= (int)g_toc_cache.size()) return -1;
+    int sp = g_toc_cache[idx].spine_index;
+    Serial.printf("[CJ] tap (%d,%d) -> row=%d toc[%d]='%s' spine=%d\n",
+                  x, y, row, idx, g_toc_cache[idx].title.c_str(), sp);
+    return sp;
+}
+
+// Convert a tap on the TODO list view into the item index, or -1 if outside
+// any row. Touch Y is inverted relative to render Y, same fix as chapter_jump.
+static int todo_hit_test(int16_t x, int16_t y) {
+    int screen_y = EPD_HEIGHT - 1 - y;
+    int rows_top = LIST_Y + 60 - 30;
+    int row = (screen_y - rows_top) / LINE_HEIGHT;
+    const int max_rows = 8;
+    if (row < 0 || row >= max_rows) return -1;
+    if (row >= (int)g_todos.size()) return -1;
+    return row;
+}
+
+// Tappable TODO list view. Tap a row → toggle done. Editing of *content*
+// (text, add, remove) still happens in the hub web UI.
+static void render_todo_list() {
+    Serial.printf("render_todo_list: %u items\n", (unsigned)g_todos.size());
+    Serial.flush();
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int32_t cx = LIST_X, cy = LIST_Y;
+    char header[64];
+    int n_done = 0;
+    for (const auto &it : g_todos) if (it.done) ++n_done;
+    snprintf(header, sizeof(header), "TODO  (%u/%u done)",
+             (unsigned)n_done, (unsigned)g_todos.size());
+    writeln((GFXfont *)&FiraSans, header, &cx, &cy, framebuffer);
+
+    if (g_todos.empty()) {
+        cx = LIST_X; cy = LIST_Y + 120;
+        writeln((GFXfont *)&FiraSans, "No TODO items yet.",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy = LIST_Y + 180;
+        writeln((GFXfont *)&FiraSans,
+                "Add some via the hub web UI.",
+                &cx, &cy, framebuffer);
+    } else {
+        const int max_rows = 8;
+        for (size_t i = 0; i < g_todos.size() && (int)i < max_rows; ++i) {
+            cx = LIST_X + 40;
+            cy = LIST_Y + 60 + (int)i * LINE_HEIGHT;
+            const char *prefix = g_todos[i].done ? "[x] " : "[ ] ";
+            std::string line = std::string(prefix) + g_todos[i].text;
+            if (line.size() > 56) line = line.substr(0, 53) + "...";
+            writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
+        }
+        if ((int)g_todos.size() > max_rows) {
+            cx = LIST_X + 40;
+            cy = LIST_Y + 60 + max_rows * LINE_HEIGHT;
+            char more[40];
+            snprintf(more, sizeof(more), "... and %d more (see hub)",
+                     (int)g_todos.size() - max_rows);
+            writeln((GFXfont *)&FiraSans, more, &cx, &cy, framebuffer);
+        }
+    }
+
+    // Footer: divider + small hint
+    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
+    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
+    writeln((GFXfont *)&firasans_small,
+            "tap a row = toggle done    tap top or bottom-right = library    button = same",
+            &fx, &fy, framebuffer);
+
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
 }
 
 static void move_selection(int delta) {
@@ -936,6 +1298,15 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 <button>save settings</button>
 <div id=settings_status class=muted></div>
 </form>
+<form id=tf onsubmit="addTodo(event)">
+<h3>todo</h3>
+<div id=todos class=muted>loading...</div>
+<div style="display:flex;gap:.4em;margin-top:.6em;">
+ <input type=text id=todo_text maxlength=200 placeholder="new item" style="flex:1;font-size:1em;padding:.3em" required/>
+ <button>add</button>
+</div>
+<div id=todo_status class=muted></div>
+</form>
 <script>
  var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
  var jsq=function(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");};
@@ -1025,8 +1396,68 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
     st.textContent='save failed: '+err.message;
    });
  };
+ var todoState=[];
+ var renderTodos=function(){
+  var d=document.getElementById('todos');
+  if(!todoState.length){d.innerHTML='<p class=muted>(empty)</p>';return;}
+  d.innerHTML=todoState.map(function(it,i){
+   var checked=it.done?' checked':'';
+   return '<div class=book>'+
+    '<div class=book-row>'+
+     '<input type=checkbox data-i='+i+' onchange="toggleTodo('+i+')"'+checked+'/>'+
+     '<span class=book-name'+(it.done?' style="text-decoration:line-through;color:#888"':'')+'>'+esc(it.text)+'</span>'+
+     '<button class=btn-link onclick="delTodo('+i+')">delete</button>'+
+    '</div>'+
+   '</div>';
+  }).join('');
+ };
+ var loadTodos=function(){
+  fetch('/api/todos').then(function(r){return r.json();}).then(function(j){
+   todoState=(j&&j.items)?j.items:[];
+   renderTodos();
+  });
+ };
+ var saveTodos=function(){
+  var st=document.getElementById('todo_status');
+  var fd=new URLSearchParams();
+  fd.append('items',JSON.stringify(todoState));
+  st.textContent='saving...';
+  fetch('/api/todos',{method:'POST',body:fd,
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){
+    if(!r.ok) return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});
+    return r.json();
+   })
+   .then(function(){st.textContent='saved';})
+   .catch(function(err){st.textContent='save failed: '+err.message;loadTodos();});
+ };
+ var addTodo=function(e){
+  e.preventDefault();
+  var input=document.getElementById('todo_text');
+  var t=(input.value||'').trim();
+  if(!t) return;
+  if(t.length>200){document.getElementById('todo_status').textContent='item too long (max 200 chars)';return;}
+  if(todoState.length>=50){document.getElementById('todo_status').textContent='max 50 items';return;}
+  todoState.push({text:t,done:false});
+  input.value='';
+  renderTodos();
+  saveTodos();
+ };
+ var toggleTodo=function(i){
+  if(i<0||i>=todoState.length) return;
+  todoState[i].done=!todoState[i].done;
+  renderTodos();
+  saveTodos();
+ };
+ var delTodo=function(i){
+  if(i<0||i>=todoState.length) return;
+  todoState.splice(i,1);
+  renderTodos();
+  saveTodos();
+ };
  load();
  loadSettings();
+ loadTodos();
 </script></body></html>
 )HTML";
 
@@ -1080,6 +1511,86 @@ static void ap_handle_settings_post(AsyncWebServerRequest *req) {
     }
     req->send(200, "application/json", changed ? "{\"ok\":true,\"changed\":true}"
                                                 : "{\"ok\":true,\"changed\":false}");
+}
+
+static void ap_handle_todos_get(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    Serial.printf("[HTTP] GET /api/todos (n=%u)\n", (unsigned)g_todos.size());
+    JsonDocument doc;
+    JsonArray items = doc["items"].to<JsonArray>();
+    for (const TodoItem &it : g_todos) {
+        JsonObject o = items.add<JsonObject>();
+        o["text"] = it.text;
+        o["done"] = it.done;
+    }
+    String out;
+    serializeJson(doc, out);
+    req->send(200, "application/json", out);
+}
+
+static void ap_handle_todos_post(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    Serial.printf("[HTTP] POST /api/todos — params: %d\n", req->params());
+    if (!req->hasParam("items", true)) {
+        req->send(400, "application/json",
+                  "{\"error\":\"missing items field\"}");
+        return;
+    }
+    String raw = req->getParam("items", true)->value();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, raw);
+    if (err) {
+        Serial.printf("[TODOS] POST parse failed: %s\n", err.c_str());
+        req->send(400, "application/json",
+                  "{\"error\":\"invalid json\"}");
+        return;
+    }
+    if (!doc.is<JsonArray>()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"items must be a JSON array\"}");
+        return;
+    }
+    JsonArrayConst arr = doc.as<JsonArrayConst>();
+    if (arr.size() > TODOS_MAX_ITEMS) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "{\"error\":\"too many items (max %u)\"}",
+                 (unsigned)TODOS_MAX_ITEMS);
+        req->send(400, "application/json", buf);
+        return;
+    }
+    std::vector<TodoItem> next;
+    next.reserve(arr.size());
+    for (JsonVariantConst v : arr) {
+        const char *t = v["text"] | "";
+        bool d = v["done"] | false;
+        if (!t) t = "";
+        size_t tlen = strlen(t);
+        if (tlen > TODOS_MAX_TEXT) {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "{\"error\":\"item too long (max %u chars)\"}",
+                     (unsigned)TODOS_MAX_TEXT);
+            req->send(400, "application/json", buf);
+            return;
+        }
+        if (tlen == 0) continue;   // skip blanks silently
+        TodoItem it;
+        it.text.assign(t, tlen);
+        it.done = d;
+        next.push_back(std::move(it));
+    }
+    g_todos.swap(next);
+    bool ok = save_todos();
+    if (!ok) {
+        req->send(500, "application/json",
+                  "{\"error\":\"save failed\"}");
+        return;
+    }
+    char buf[48];
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"count\":%u}",
+             (unsigned)g_todos.size());
+    req->send(200, "application/json", buf);
 }
 
 static void ap_handle_books_json(AsyncWebServerRequest *req) {
@@ -1241,6 +1752,8 @@ static void enter_ap_mode() {
     web_server->on("/api/books", HTTP_GET, ap_handle_books_json);
     web_server->on("/api/settings", HTTP_GET, ap_handle_settings_get);
     web_server->on("/api/settings", HTTP_POST, ap_handle_settings_post);
+    web_server->on("/api/todos", HTTP_GET, ap_handle_todos_get);
+    web_server->on("/api/todos", HTTP_POST, ap_handle_todos_post);
     web_server->on("/ping", HTTP_GET, [](AsyncWebServerRequest *r) {
         Serial.println("[HTTP] GET /ping");
         r->send(200, "text/plain", "pong");
@@ -1371,6 +1884,7 @@ void setup() {
 
     load_settings();
     apply_density();
+    load_todos();
 
     scan_sd_for_epubs();
     clear_and_flush();
@@ -1506,6 +2020,9 @@ static void handle_serial_commands() {
                 if (app_mode == MODE_BOOK && ch >= 0 && ch < total_spine) {
                     if (load_chapter(ch)) render_book_page();
                 }
+            } else if (cmd == "todo") {
+                app_mode = MODE_TODO;
+                render_todo_list();
             } else if (cmd == "share") {
                 enter_ap_mode();
             } else if (cmd == "stop_share" || cmd == "unshare") {
@@ -1592,15 +2109,104 @@ void loop() {
                 Serial.printf("tap (%d,%d) zone=%d mode=%d\n",
                               xs[0], ys[0], zone, app_mode);
                 Serial.flush();
-                if (app_mode == MODE_BOOK) {
-                    if (ys[0] < 80) {
+                // Bottom-right corner toggles TODO view from library, and
+                // exits TODO view back to library. (Touch orientation makes
+                // the top-right corner unreliable; bottom-right is solid.)
+                bool corner_right = (xs[0] > EPD_WIDTH - 100 &&
+                                     ys[0] > EPD_HEIGHT - 100);
+                if (app_mode == MODE_TODO) {
+                    // Top edge or bottom-right corner exits.
+                    if (ys[0] > EPD_HEIGHT - 80 || corner_right) {
+                        Serial.println("[TAP] exit TODO -> library");
+                        app_mode = MODE_LIBRARY;
+                        render_book_list();
+                    } else {
+                        int row = todo_hit_test(xs[0], ys[0]);
+                        if (row >= 0) {
+                            g_todos[row].done = !g_todos[row].done;
+                            Serial.printf("[TODO] toggle row %d -> %s\n",
+                                          row, g_todos[row].done ? "done" : "open");
+                            save_todos();
+                            render_todo_list();
+                        }
+                    }
+                } else if (app_mode == MODE_BOOK_END) {
+                    if (xs[0] < EPD_WIDTH / 2 && ys[0] < EPD_HEIGHT - 80) {
+                        app_mode = MODE_BOOK;
+                        render_book_page();
+                    } else {
+                        app_mode = MODE_LIBRARY;
+                        render_book_list();
+                    }
+                } else if (app_mode == MODE_CHAPTER_JUMP) {
+                    if (ys[0] > EPD_HEIGHT - 80) {
+                        // Top strip: paginate or cancel.
+                        int total = (int)g_toc_cache.size();
+                        int total_pages =
+                            (total + CJ_ROWS_PER_PAGE - 1) / CJ_ROWS_PER_PAGE;
+                        if (total_pages > 1 && xs[0] < 200) {
+                            cj_first -= CJ_ROWS_PER_PAGE;
+                            if (cj_first < 0) cj_first = 0;
+                            render_chapter_jump();
+                        } else if (total_pages > 1 &&
+                                   xs[0] > EPD_WIDTH - 200) {
+                            int next = cj_first + CJ_ROWS_PER_PAGE;
+                            if (next < total) {
+                                cj_first = next;
+                                render_chapter_jump();
+                            }
+                        } else {
+                            app_mode = MODE_BOOK;
+                            render_book_page();
+                        }
+                    } else {
+                        int hit = chapter_jump_hit_test(xs[0], ys[0]);
+                        if (hit >= 0 && hit < total_spine) {
+                            Serial.printf("[CJ] jump to chapter %d\n", hit);
+                            if (load_chapter(hit)) {
+                                app_mode = MODE_BOOK;
+                                render_book_page();
+                                save_position();
+                            } else {
+                                app_mode = MODE_BOOK;
+                                render_book_page();
+                            }
+                        }
+                    }
+                } else if (app_mode == MODE_BOOK) {
+                    // Touch coord origin is bottom-left of screen, so the
+                    // user's *top* strip is high Y, not low Y.
+                    bool top_strip = (ys[0] > EPD_HEIGHT - 80);
+                    bool bottom_left_corner = (xs[0] < 100 && ys[0] < 80);
+                    if (top_strip) {
                         Serial.println("[TAP] top → back to library");
                         app_mode = MODE_LIBRARY;
                         render_book_list();
+                    } else if (bottom_left_corner) {
+                        // Bottom-left corner = open chapter jump list.
+                        Serial.println("[TAP] bottom-left → chapter jump");
+                        // Scroll to the page containing the current TOC entry,
+                        // if any, so the user lands near where they are.
+                        int cur_toc = -1, best_si = -1;
+                        for (size_t i = 0; i < g_toc_cache.size(); ++i) {
+                            if (g_toc_cache[i].spine_index <= current_spine &&
+                                g_toc_cache[i].spine_index > best_si) {
+                                best_si = g_toc_cache[i].spine_index;
+                                cur_toc = (int)i;
+                            }
+                        }
+                        cj_first = (cur_toc < 0) ? 0
+                                 : (cur_toc / CJ_ROWS_PER_PAGE) * CJ_ROWS_PER_PAGE;
+                        app_mode = MODE_CHAPTER_JUMP;
+                        render_chapter_jump();
                     } else if (xs[0] < EPD_WIDTH / 2) book_prev_page();
                     else book_next_page();
-                } else {
-                    if (zone == 1) move_selection(-1);
+                } else {  // MODE_LIBRARY
+                    if (corner_right) {
+                        Serial.println("[TAP] bottom-right -> TODO view");
+                        app_mode = MODE_TODO;
+                        render_todo_list();
+                    } else if (zone == 1) move_selection(-1);
                     else if (zone == 3) move_selection(+1);
                     else if (zone == 2) open_selected();
                 }
@@ -1637,7 +2243,13 @@ void loop() {
                     Serial.println("[BTN] long press (released) → AP mode");
                     enter_ap_mode();
                     input_cooldown_until = now + 1000;
-                } else if (app_mode == MODE_BOOK) {
+                } else if (app_mode == MODE_CHAPTER_JUMP) {
+                    // Cancel back to book
+                    app_mode = MODE_BOOK;
+                    render_book_page();
+                    input_cooldown_until = now + 600;
+                } else if (app_mode == MODE_BOOK || app_mode == MODE_TODO ||
+                           app_mode == MODE_BOOK_END) {
                     app_mode = MODE_LIBRARY;
                     render_book_list();
                     input_cooldown_until = now + 600;
