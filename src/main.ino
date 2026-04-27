@@ -49,7 +49,7 @@ static uint8_t *framebuffer = nullptr;
 static TouchDrvGT911 touch;
 static bool touchOnline = false;
 
-enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP };
+enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP, MODE_BOOK_END };
 static AppMode app_mode = MODE_LIBRARY;
 
 // library mode
@@ -731,10 +731,19 @@ static void render_book_page() {
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
     // 3-column footer rendered in the smaller font so it occupies less vertical
-    // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B]
-    int book_progress_pct = (total_spine > 0)
-        ? (current_spine * 100) / total_spine
-        : 0;
+    // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B].
+    // book_progress_pct counts chapters completed + the fraction of pages read
+    // in the current chapter, so the last page of the last chapter is 100%.
+    int book_progress_pct = 0;
+    if (total_spine > 0 && !chapter_pages.empty()) {
+        int chap_pages = (int)chapter_pages.size();
+        int read_pages = chap_pages * current_spine + (current_page_in_chapter + 1);
+        int total_pages_est = chap_pages * total_spine;
+        if (total_pages_est > 0) {
+            book_progress_pct = (read_pages * 100 + total_pages_est / 2) / total_pages_est;
+            if (book_progress_pct > 100) book_progress_pct = 100;
+        }
+    }
     const GFXfont *small = (const GFXfont *)&firasans_small;
     int32_t footer_y = EPD_HEIGHT - 12;
     // divider just above the footer text
@@ -784,6 +793,36 @@ static void render_book_page() {
     }
 }
 
+// "You finished the book!" screen shown after the last page. From here a tap
+// goes back to the library; a long button-press still does AP/sleep.
+static void render_book_end() {
+    Serial.println("[BOOK] reached end-of-book");
+    Serial.flush();
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int32_t cx = LIST_X, cy = 200;
+    writeln((GFXfont *)&FiraSans, "You finished the book.",
+            &cx, &cy, framebuffer);
+
+    cx = LIST_X; cy = 280;
+    char info[80];
+    if (selected >= 0 && selected < (int)books.size()) {
+        std::string title = books[selected];
+        size_t dot = title.rfind(".epub");
+        if (dot != std::string::npos) title.erase(dot);
+        if (title.size() > 50) title = title.substr(0, 47) + "...";
+        snprintf(info, sizeof(info), "%s", title.c_str());
+        writeln((GFXfont *)&FiraSans, info, &cx, &cy, framebuffer);
+    }
+
+    // (no footer hints on the end screen — feels nicer to land on)
+
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
+
 // Advance/go-back a page; cross chapter boundaries by loading next/prev spine item.
 static void book_next_page() {
     if (current_page_in_chapter + 1 < (int)chapter_pages.size()) {
@@ -792,6 +831,10 @@ static void book_next_page() {
         save_position();
     } else if (current_spine + 1 < total_spine) {
         if (load_chapter(current_spine + 1)) { render_book_page(); save_position(); }
+    } else {
+        // last page of last chapter — show the end screen
+        app_mode = MODE_BOOK_END;
+        render_book_end();
     }
 }
 
@@ -884,18 +927,7 @@ static void render_book_list() {
         }
     }
 
-    // footer: tap zones legend in the smaller font, with a divider above.
-    draw_hline(EPD_HEIGHT - 80, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
-    cx = LIST_X;
-    cy = EPD_HEIGHT - 50;
-    writeln((GFXfont *)&firasans_small,
-            "tap left/right = navigate   tap center = open   tap bottom-right = TODO",
-            &cx, &cy, framebuffer);
-    cx = LIST_X;
-    cy = EPD_HEIGHT - 12;
-    writeln((GFXfont *)&firasans_small,
-            "hold button:  2s = WiFi share    5s = sleep",
-            &cx, &cy, framebuffer);
+    // (footer hints intentionally removed — clean library look)
 
     epd_poweron();
     epd_clear();
@@ -977,12 +1009,7 @@ static void render_chapter_jump() {
         }
     }
 
-    // Footer hint
-    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
-    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
-    writeln((GFXfont *)&firasans_small,
-            "tap a row to jump   -   tap top-left/right to page   -   tap top-center to cancel",
-            &fx, &fy, framebuffer);
+    // (footer hints intentionally removed)
 
     epd_poweron();
     epd_clear();
@@ -1006,8 +1033,20 @@ static int chapter_jump_hit_test(int16_t x, int16_t y) {
     return sp;
 }
 
-// Read-only TODO list view. Editing happens in the hub web UI; on the device
-// we just show the saved items so the user can glance at them without WiFi.
+// Convert a tap on the TODO list view into the item index, or -1 if outside
+// any row. Touch Y is inverted relative to render Y, same fix as chapter_jump.
+static int todo_hit_test(int16_t x, int16_t y) {
+    int screen_y = EPD_HEIGHT - 1 - y;
+    int rows_top = LIST_Y + 60 - 30;
+    int row = (screen_y - rows_top) / LINE_HEIGHT;
+    const int max_rows = 8;
+    if (row < 0 || row >= max_rows) return -1;
+    if (row >= (int)g_todos.size()) return -1;
+    return row;
+}
+
+// Tappable TODO list view. Tap a row → toggle done. Editing of *content*
+// (text, add, remove) still happens in the hub web UI.
 static void render_todo_list() {
     Serial.printf("render_todo_list: %u items\n", (unsigned)g_todos.size());
     Serial.flush();
@@ -1048,13 +1087,6 @@ static void render_todo_list() {
             writeln((GFXfont *)&FiraSans, more, &cx, &cy, framebuffer);
         }
     }
-
-    // Footer: divider + small hint
-    draw_hline(EPD_HEIGHT - 50, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
-    int32_t fx = LIST_X, fy = EPD_HEIGHT - 18;
-    writeln((GFXfont *)&firasans_small,
-            "tap bottom-right or center to return to library    button = same",
-            &fx, &fy, framebuffer);
 
     epd_poweron();
     epd_clear();
@@ -2056,8 +2088,26 @@ void loop() {
                 bool corner_right = (xs[0] > EPD_WIDTH - 100 &&
                                      ys[0] > EPD_HEIGHT - 100);
                 if (app_mode == MODE_TODO) {
-                    if (corner_right || zone == 2) {
+                    // Top edge or bottom-right corner exits.
+                    if (ys[0] > EPD_HEIGHT - 80 || corner_right) {
                         Serial.println("[TAP] exit TODO -> library");
+                        app_mode = MODE_LIBRARY;
+                        render_book_list();
+                    } else {
+                        int row = todo_hit_test(xs[0], ys[0]);
+                        if (row >= 0) {
+                            g_todos[row].done = !g_todos[row].done;
+                            Serial.printf("[TODO] toggle row %d -> %s\n",
+                                          row, g_todos[row].done ? "done" : "open");
+                            save_todos();
+                            render_todo_list();
+                        }
+                    }
+                } else if (app_mode == MODE_BOOK_END) {
+                    if (xs[0] < EPD_WIDTH / 2 && ys[0] < EPD_HEIGHT - 80) {
+                        app_mode = MODE_BOOK;
+                        render_book_page();
+                    } else {
                         app_mode = MODE_LIBRARY;
                         render_book_list();
                     }
@@ -2171,7 +2221,8 @@ void loop() {
                     app_mode = MODE_BOOK;
                     render_book_page();
                     input_cooldown_until = now + 600;
-                } else if (app_mode == MODE_BOOK || app_mode == MODE_TODO) {
+                } else if (app_mode == MODE_BOOK || app_mode == MODE_TODO ||
+                           app_mode == MODE_BOOK_END) {
                     app_mode = MODE_LIBRARY;
                     render_book_list();
                     input_cooldown_until = now + 600;
