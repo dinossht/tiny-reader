@@ -33,7 +33,12 @@
 #include "freesans_body_italic.h"    // 22pt body italic (oblique)
 #include "freesans_body_bolditalic.h" // 22pt body bold-italic
 #include "freesans_title.h"          // 32pt title font for screen headers
-#include "logo.h"                    // 1-bit packed boot-splash logo
+#include "logo.h"                    // 1-bit packed book-sparkle logo
+#include "todo_logo.h"               // 1-bit packed notepad-checkmark logo
+#include "qr_wifi.h"                 // pre-generated WIFI:tiny-reader/bv-birdy QR
+extern "C" {
+#include "tjpgd.h"                   // tiny JPEG decoder (grayscale output)
+}
 #include "hub_html.h"                // generated from src/hub.html (HUB_HTML[])
 #include "utilities.h"
 #include <TouchDrvGT911.hpp>
@@ -57,14 +62,15 @@ static uint8_t *framebuffer = nullptr;
 static TouchDrvGT911 touch;
 static bool touchOnline = false;
 
-enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP, MODE_BOOK_END };
+enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP,
+               MODE_BOOK_END, MODE_BOOKMARK_LIST };
 static AppMode app_mode = MODE_LIBRARY;
 
 // library mode
 static std::vector<std::string> books;   // filenames in SD root ending .epub
 static int selected = 0;                 // index in books
 static int page_first = 0;               // first index visible on the screen
-static const int LINES_PER_PAGE = 6;     // 6 leaves space for the header gap and the tiny-todo button
+static const int LINES_PER_PAGE = 4;     // taller rows for cover thumbnails (~96 px each)
 static const int LINE_HEIGHT = 56;
 static const int LIST_X = 60;
 static const int LIST_Y = 80;
@@ -686,6 +692,125 @@ struct ChapterLoadResult {
     std::vector<TocCacheEntry> toc;   // spine_index -> chapter title (NCX TOC)
 };
 
+// ---- Cover thumbnail cache ------------------------------------------------
+// Each book gets a tiny grayscale thumbnail (4-bit packed) extracted from
+// its EPUB cover image once, cached on SD as "<bookname>.thumb". The
+// library row blits it next to the title. No decode at render time.
+static const int THUMB_W = 80;
+static const int THUMB_H = 110;
+static const size_t THUMB_BYTES = (size_t)THUMB_W * THUMB_H / 2;
+
+static String thumb_path_for_name(const String &name) {
+    int dot = name.lastIndexOf('.');
+    if (dot <= 0) dot = name.length();
+    return String("/") + name.substring(0, dot) + ".thumb";
+}
+
+struct TjpgCtx {
+    const uint8_t *jpeg;
+    size_t jpeg_size;
+    size_t jpeg_pos;
+    uint8_t *gray;
+    int gray_w, gray_h;
+};
+
+static size_t tjpg_input_cb(JDEC *jd, uint8_t *buf, size_t sz) {
+    TjpgCtx *ctx = (TjpgCtx *)jd->device;
+    size_t avail = ctx->jpeg_size - ctx->jpeg_pos;
+    if (sz > avail) sz = avail;
+    if (buf) memcpy(buf, ctx->jpeg + ctx->jpeg_pos, sz);
+    ctx->jpeg_pos += sz;
+    return sz;
+}
+
+static int tjpg_output_cb(JDEC *jd, void *bitmap, JRECT *rect) {
+    TjpgCtx *ctx = (TjpgCtx *)jd->device;
+    const uint8_t *src = (const uint8_t *)bitmap;
+    for (int y = rect->top; y <= rect->bottom; ++y) {
+        for (int x = rect->left; x <= rect->right; ++x) {
+            if (x >= 0 && x < ctx->gray_w && y >= 0 && y < ctx->gray_h) {
+                ctx->gray[y * ctx->gray_w + x] = *src;
+            }
+            ++src;
+        }
+    }
+    return 1;
+}
+
+static bool decode_cover_jpeg(const uint8_t *jpeg, size_t jpeg_size,
+                              uint8_t *thumb_4bit) {
+    JDEC jd;
+    void *workbuf = ps_malloc(3100);
+    if (!workbuf) return false;
+    TjpgCtx ctx = {jpeg, jpeg_size, 0, nullptr, 0, 0};
+    JRESULT r = jd_prepare(&jd, tjpg_input_cb, workbuf, 3100, &ctx);
+    if (r != JDR_OK) {
+        Serial.printf("[THUMB] jd_prepare failed: %d\n", r);
+        free(workbuf);
+        return false;
+    }
+    int scale = 0;
+    while (scale < 3 &&
+           ((jd.width >> scale) > 256 || (jd.height >> scale) > 384))
+        ++scale;
+    int gw = jd.width >> scale;
+    int gh = jd.height >> scale;
+    if (gw <= 0 || gh <= 0) { free(workbuf); return false; }
+    ctx.gray = (uint8_t *)ps_malloc((size_t)gw * gh);
+    if (!ctx.gray) { free(workbuf); return false; }
+    ctx.gray_w = gw; ctx.gray_h = gh;
+
+    r = jd_decomp(&jd, tjpg_output_cb, scale);
+    free(workbuf);
+    if (r != JDR_OK) {
+        Serial.printf("[THUMB] jd_decomp failed: %d\n", r);
+        free(ctx.gray);
+        return false;
+    }
+    memset(thumb_4bit, 0xFF, THUMB_BYTES);
+    for (int y = 0; y < THUMB_H; ++y) {
+        int sy = y * gh / THUMB_H;
+        for (int x = 0; x < THUMB_W; ++x) {
+            int sx = x * gw / THUMB_W;
+            uint8_t g = ctx.gray[sy * gw + sx];
+            uint8_t nib = g >> 4;
+            int idx = (y * THUMB_W + x) / 2;
+            if (x & 1) thumb_4bit[idx] = (thumb_4bit[idx] & 0x0F) | (nib << 4);
+            else       thumb_4bit[idx] = (thumb_4bit[idx] & 0xF0) | nib;
+        }
+    }
+    free(ctx.gray);
+    return true;
+}
+
+static void generate_thumb_if_missing(Epub &epub, const std::string &book_path) {
+    size_t slash = book_path.find_last_of('/');
+    std::string fname = (slash != std::string::npos)
+                        ? book_path.substr(slash + 1) : book_path;
+    String thumb_path = thumb_path_for_name(String(fname.c_str()));
+    if (SD.exists(thumb_path)) return;
+    const std::string &cover_href = epub.get_cover_image_item();
+    if (cover_href.empty()) return;
+    size_t size = 0;
+    uint8_t *data = epub.get_item_contents(cover_href, &size);
+    if (!data || size == 0) { if (data) free(data); return; }
+    uint8_t *thumb = (uint8_t *)heap_caps_malloc(THUMB_BYTES, MALLOC_CAP_8BIT);
+    if (!thumb) { free(data); return; }
+    bool ok = decode_cover_jpeg(data, size, thumb);
+    free(data);
+    if (ok) {
+        File f = SD.open(thumb_path, FILE_WRITE);
+        if (f) {
+            f.write(thumb, THUMB_BYTES);
+            f.close();
+            Serial.printf("[THUMB] cached %s\n", thumb_path.c_str());
+        }
+    } else {
+        Serial.printf("[THUMB] decode failed for %s\n", fname.c_str());
+    }
+    free(thumb);
+}
+
 static void chapter_load_task(void *param) {
     ChapterLoadResult *r = (ChapterLoadResult *)param;
     Epub epub(r->path);
@@ -728,6 +853,8 @@ static void chapter_load_task(void *param) {
                               r->spine_to_load, (unsigned)size);
             }
         }
+        // Cache the cover thumbnail on first load (skipped if already cached).
+        generate_thumb_if_missing(epub, r->path);
     }
     r->done = true;
     vTaskDelete(NULL);
@@ -756,6 +883,67 @@ static String pos_path_for_name(const String &name) {
     int dot = name.lastIndexOf('.');
     if (dot <= 0) dot = name.length();
     return String("/") + name.substring(0, dot) + ".pos";
+}
+
+// SD path "/<book-without-extension>.bm" — one bookmark per line as
+// "spine page". Read into g_bookmarks at book-open, written on toggle.
+static String bookmark_path_for_name(const String &name) {
+    int dot = name.lastIndexOf('.');
+    if (dot <= 0) dot = name.length();
+    return String("/") + name.substring(0, dot) + ".bm";
+}
+
+static std::vector<std::pair<int,int>> g_bookmarks;
+
+static void load_bookmarks_for_current() {
+    g_bookmarks.clear();
+    if (selected < 0 || selected >= (int)books.size()) return;
+    File f = SD.open(bookmark_path_for_name(String(books[selected].c_str())),
+                     FILE_READ);
+    if (!f) return;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        int sp = -1, pg = -1;
+        if (sscanf(line.c_str(), "%d %d", &sp, &pg) == 2 && sp >= 0 && pg >= 0) {
+            g_bookmarks.push_back({sp, pg});
+        }
+    }
+    f.close();
+    Serial.printf("[BM] loaded %u bookmark(s)\n", (unsigned)g_bookmarks.size());
+}
+
+static void save_bookmarks_for_current() {
+    if (selected < 0 || selected >= (int)books.size()) return;
+    String path = bookmark_path_for_name(String(books[selected].c_str()));
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { Serial.printf("[BM] open %s failed\n", path.c_str()); return; }
+    for (const auto &b : g_bookmarks) f.printf("%d %d\n", b.first, b.second);
+    f.close();
+    Serial.printf("[BM] saved %u bookmark(s)\n", (unsigned)g_bookmarks.size());
+}
+
+static bool is_current_bookmarked() {
+    for (const auto &b : g_bookmarks) {
+        if (b.first == current_spine && b.second == current_page_in_chapter)
+            return true;
+    }
+    return false;
+}
+
+static void toggle_bookmark_on_current_page() {
+    for (auto it = g_bookmarks.begin(); it != g_bookmarks.end(); ++it) {
+        if (it->first == current_spine &&
+            it->second == current_page_in_chapter) {
+            g_bookmarks.erase(it);
+            Serial.println("[BM] removed");
+            save_bookmarks_for_current();
+            return;
+        }
+    }
+    g_bookmarks.push_back({current_spine, current_page_in_chapter});
+    Serial.printf("[BM] added (ch=%d p=%d)\n",
+                  current_spine, current_page_in_chapter);
+    save_bookmarks_for_current();
 }
 
 // .pos format: "<spine> <page> [<percent> [<chapter_pages>]]\n".
@@ -1232,6 +1420,25 @@ static void flush_framebuffer(bool force_full = false) {
     g_last_interact_ms = millis();
 }
 
+// Filled triangle in the top-right corner of the page = "this page is
+// bookmarked" (a dog-eared corner). Drawn in render_book_page when
+// is_current_bookmarked() is true. Size is in pixels along the diagonal.
+static void draw_dogear(int size, uint8_t *fb) {
+    const int x_right = EPD_WIDTH - 1;
+    const int y_top   = 0;
+    // Triangle vertices: (x_right, y_top), (x_right, y_top+size),
+    // (x_right - size, y_top). Filled scanline-by-scanline.
+    for (int dy = 0; dy <= size; ++dy) {
+        int reach = size - dy;  // shrinks as we go down
+        for (int dx = 0; dx <= reach; ++dx) {
+            int px = x_right - dx, py = y_top + dy;
+            if (px < 0 || px >= EPD_WIDTH || py < 0 || py >= EPD_HEIGHT) continue;
+            int idx = (py * EPD_WIDTH + px) / 2;
+            fb[idx] &= (px & 1) ? 0x0F : 0xF0;
+        }
+    }
+}
+
 // Right-pointing filled triangle "▶" — used as the selection cursor in the
 // library and chapter-jump screens. (x, y_top) is the bounding box top-left;
 // width is ~3/4 of `size` so it has a tasteful aspect ratio.
@@ -1292,6 +1499,10 @@ static void render_book_page() {
     int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X - BODY_RIGHT_RESERVE;
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
+    // Dog-ear in the top-right corner if this page is bookmarked. Sits
+    // outside the body's text band so it never conflicts with letters.
+    if (is_current_bookmarked()) draw_dogear(36, framebuffer);
+
     // 3-column footer rendered in the smaller font so it occupies less vertical
     // space and reads as secondary metadata: [battery%] [Ch X/Y · NN%] [p A/B].
     // book_progress_pct counts chapters completed + the fraction of pages read
@@ -1311,8 +1522,18 @@ static void render_book_page() {
     // divider just above the footer text — match the body's effective right
     // edge (target_w + BOOK_MARGIN_X) so the line aligns with where text
     // actually ends, not the raw margin point.
-    draw_hline(EPD_HEIGHT - 42, BOOK_MARGIN_X,
-               EPD_WIDTH - BOOK_MARGIN_X - BODY_RIGHT_RESERVE, framebuffer);
+    int divider_x0 = BOOK_MARGIN_X;
+    int divider_x1 = EPD_WIDTH - BOOK_MARGIN_X - BODY_RIGHT_RESERVE;
+    draw_hline(EPD_HEIGHT - 42, divider_x0, divider_x1, framebuffer);
+    // Thin book-progress bar at the very bottom — replaces the verbose
+    // "NN% read" text we used to put next to the chapter label. Filled
+    // portion = book_progress_pct of the body width.
+    {
+        int track_y = EPD_HEIGHT - 2;
+        int fill_w = ((divider_x1 - divider_x0) * book_progress_pct) / 100;
+        if (fill_w > 0)
+            draw_hline(track_y, divider_x0, divider_x0 + fill_w, framebuffer);
+    }
     int batt_pct = read_battery_percent();
 
     // Layout: chapter (left) | page X/Y (center) | battery icon + % (right).
@@ -1453,6 +1674,47 @@ static void draw_corner_button(const char *label) {
     draw_rect_rounded(btn_x0, btn_y0, btn_x1, btn_y1, 8, framebuffer);
 }
 
+// Draw a 1-bit packed bitmap at the visual bottom-right of the screen,
+// down-sampled by `stride` (so 200×180 with stride=5 → 40×36). Used as
+// the icon-only corner button for switching between library and todo
+// views — replaces `draw_corner_button` for those two screens.
+static void draw_corner_icon(const uint8_t *bits, int w, int h, int stride) {
+    int sw = w / stride, sh = h / stride;
+    int x_right = EPD_WIDTH - 30;
+    int y_bottom = EPD_HEIGHT - 18;
+    int sx = x_right - sw, sy = y_bottom - sh;
+    int row_bytes = (w + 7) / 8;
+    for (int y = 0; y < h; y += stride) {
+        for (int x = 0; x < w; x += stride) {
+            if (!(bits[y * row_bytes + (x >> 3)] & (0x80 >> (x & 7)))) continue;
+            int dy = sy + y / stride, dx = sx + x / stride;
+            if (dy < 0 || dy >= EPD_HEIGHT || dx < 0 || dx >= EPD_WIDTH) continue;
+            int idx = (dy * EPD_WIDTH + dx) / 2;
+            framebuffer[idx] &= (dx & 1) ? 0x0F : 0xF0;
+        }
+    }
+}
+
+// Draw a 1-bit logo at half-scale at the top of a screen, with a title
+// rendered next to it in the 32 pt face. Used for the library / TODO
+// page headers so they share visual style.
+static void draw_screen_header(const uint8_t *bits, int w, int h,
+                               const char *title) {
+    int sx = LIST_X, sy = 20;
+    int row_bytes = (w + 7) / 8;
+    for (int y = 0; y < h; y += 2) {
+        for (int x = 0; x < w; x += 2) {
+            if (!(bits[y * row_bytes + (x >> 3)] & (0x80 >> (x & 7)))) continue;
+            int dy = sy + y / 2, dx = sx + x / 2;
+            if (dy < 0 || dy >= EPD_HEIGHT || dx < 0 || dx >= EPD_WIDTH) continue;
+            int idx = (dy * EPD_WIDTH + dx) / 2;
+            framebuffer[idx] &= (dx & 1) ? 0x0F : 0xF0;
+        }
+    }
+    int32_t hx = LIST_X + (w / 2) + 24, hy = 88;
+    writeln((GFXfont *)&freesans_title, title, &hx, &hy, framebuffer);
+}
+
 static void render_book_list() {
     Serial.printf("render_book_list: sel=%d page_first=%d total=%u\n",
                   selected, page_first, (unsigned)books.size());
@@ -1503,34 +1765,96 @@ static void render_book_list() {
         int32_t cx = LIST_X, cy = LIST_Y + 100;
         writeln(body, "No books on the SD card.",
                 &cx, &cy, framebuffer);
-        cx = LIST_X; cy += 60;
-        writeln(small, "Hold the button >= 2s to enter WiFi share mode,",
+
+        // QR code on the right — encodes WiFi credentials so a phone scan
+        // joins the AP automatically. Then user opens 192.168.4.1 to upload.
+        const int qr_scale = 2;   // 132*2 = 264 px on screen
+        int qr_w = QR_WIFI_W * qr_scale;
+        int qr_h = QR_WIFI_H * qr_scale;
+        int qr_x = EPD_WIDTH - LIST_X - qr_w;
+        int qr_y = LIST_Y + 100;
+        int row_bytes = (QR_WIFI_W + 7) / 8;
+        for (int y = 0; y < QR_WIFI_H; ++y) {
+            for (int x = 0; x < QR_WIFI_W; ++x) {
+                if (!(QR_WIFI_BITMAP[y * row_bytes + (x >> 3)] &
+                      (0x80 >> (x & 7)))) continue;
+                for (int dy = 0; dy < qr_scale; ++dy)
+                    for (int dx = 0; dx < qr_scale; ++dx) {
+                        int px = qr_x + x * qr_scale + dx;
+                        int py = qr_y + y * qr_scale + dy;
+                        if (px < 0 || px >= EPD_WIDTH ||
+                            py < 0 || py >= EPD_HEIGHT) continue;
+                        int idx = (py * EPD_WIDTH + px) / 2;
+                        framebuffer[idx] &= (px & 1) ? 0x0F : 0xF0;
+                    }
+            }
+        }
+
+        cx = LIST_X; cy += 70;
+        writeln(small, "1. Press and hold the button to share over WiFi.",
                 &cx, &cy, framebuffer);
         cx = LIST_X; cy += 36;
-        writeln(small, "then upload .epub files via the hub.",
+        writeln(small, "2. Scan the QR (or join 'tiny-reader' / 'bv-birdy').",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy += 36;
+        writeln(small, "3. Open http://192.168.4.1 and upload .epub files.",
                 &cx, &cy, framebuffer);
     } else {
-        // Right-edge column. Bar width scales with book size (40 px short
-        // book → 120 px long book), so a glance at the row tells you "this
-        // is a chunky tome vs. a novella". The bar always ends at RIGHT_X.
+        // Layout per row: cover thumbnail on the left, then cursor + title,
+        // then state indicator on the right. Rows are ~96 px tall to fit
+        // the THUMB_H thumbnail without crowding.
         const int BAR_H = 12;
         const int RIGHT_X = EPD_WIDTH - LIST_X;
-        const int PILL_SIZE = 18;             // tri-state pill icon side
+        const int PILL_SIZE = 18;
+        const int LIB_ROW_HEIGHT = 96;
+        const int TEXT_LEFT = LIST_X + THUMB_W + 24;  // start of cursor+title
 
         int row = 0;
         for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
             bool sel = ((int)i == selected);
-            int32_t baseline = LIST_Y + 100 + row * LINE_HEIGHT;
+            int32_t baseline = LIST_Y + 110 + row * LIB_ROW_HEIGHT;
+
+            // Cover thumbnail (cached 4-bit raw on SD as <bookname>.thumb).
+            // If the thumb file is missing we just leave the slot blank;
+            // the next time the book is opened, chapter_load_task will
+            // generate one and it'll appear on the next library render.
+            String thumb_path = thumb_path_for_name(String(books[i].c_str()));
+            File tf = SD.open(thumb_path, FILE_READ);
+            int thumb_top = baseline - THUMB_H + 14;   // bottom-aligned to row
+            if (tf && tf.size() == (long)THUMB_BYTES) {
+                static uint8_t thumb_buf[THUMB_BYTES];
+                tf.read(thumb_buf, THUMB_BYTES);
+                tf.close();
+                for (int y = 0; y < THUMB_H; ++y) {
+                    for (int x = 0; x < THUMB_W; ++x) {
+                        int idx = (y * THUMB_W + x) / 2;
+                        uint8_t nib = (x & 1) ? (thumb_buf[idx] >> 4)
+                                              : (thumb_buf[idx] & 0x0F);
+                        int dx = LIST_X + x, dy = thumb_top + y;
+                        if (dx < 0 || dx >= EPD_WIDTH ||
+                            dy < 0 || dy >= EPD_HEIGHT) continue;
+                        int fbidx = (dy * EPD_WIDTH + dx) / 2;
+                        if (dx & 1)
+                            framebuffer[fbidx] = (framebuffer[fbidx] & 0x0F) |
+                                                 (nib << 4);
+                        else
+                            framebuffer[fbidx] = (framebuffer[fbidx] & 0xF0) |
+                                                 nib;
+                    }
+                }
+            } else if (tf) {
+                tf.close();
+            }
 
             // Cursor sprite (filled triangle) + title.
             std::string title = books[i];
             size_t dot = title.rfind(".epub");
             if (dot != std::string::npos) title.erase(dot);
-            if (title.size() > 38) title = title.substr(0, 35) + "...";
+            if (title.size() > 32) title = title.substr(0, 29) + "...";
             if (sel) {
-                draw_selection_marker(LIST_X, baseline - 28, 24, framebuffer);
+                draw_selection_marker(TEXT_LEFT, baseline - 28, 24, framebuffer);
             }
-            int32_t tx = LIST_X + 36, ty = baseline;
+            int32_t tx = TEXT_LEFT + 36, ty = baseline;
             writeln(body, title.c_str(), &tx, &ty, framebuffer);
 
             // Right-side tri-state: not-started (hollow pill), reading
@@ -1553,7 +1877,11 @@ static void render_book_list() {
                                        /*preserve_non_white=*/false, framebuffer);
                 continue;
             }
-            // in progress: fixed-width bar only (no percent label).
+            // in progress: fixed-width bar + estimated time remaining.
+            // Reading-time math: assume words ≈ file_size / 9 (typical EPUB
+            // text-vs-tag ratio for English) and 250 WPM reading speed, so
+            // total_minutes = file_size / 2250. Multiply by (1 - pct/100)
+            // for remaining time. Rough but useful at-a-glance signal.
             const int BAR_W = 120;
             int bar_x1 = RIGHT_X;
             int bar_x0 = bar_x1 - BAR_W;
@@ -1568,10 +1896,31 @@ static void render_book_list() {
             if (fill_w > 0)
                 fill_rect(bar_x0 + 2, by0 + 2,
                           bar_x0 + 2 + fill_w, by1 - 1, framebuffer);
+            String book_path = String("/") + books[i].c_str();
+            File f = SD.open(book_path, FILE_READ);
+            size_t fsize = f ? f.size() : 0;
+            if (f) f.close();
+            if (fsize > 0) {
+                int total_min = (int)(fsize / 2250UL);
+                int remaining = total_min * (100 - pct) / 100;
+                char est[16];
+                if (remaining <= 0) est[0] = 0;
+                else if (remaining < 60)
+                    snprintf(est, sizeof(est), "~%dm", remaining);
+                else
+                    snprintf(est, sizeof(est), "~%dh", (remaining + 30) / 60);
+                if (est[0]) {
+                    int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+                    get_text_bounds(small, est, &mx, &my, &mx1, &my1,
+                                    &mw, &mh, NULL);
+                    int32_t lx = bar_x0 - 12 - mw, ly = baseline;
+                    writeln(small, est, &lx, &ly, framebuffer);
+                }
+            }
         }
     }
 
-    draw_corner_button("tiny-todo");
+    draw_corner_icon(TODO_LOGO_BITMAP, TODO_LOGO_W, TODO_LOGO_H, 4);
 
     flush_framebuffer(/*force_full=*/true);
 
@@ -1656,6 +2005,99 @@ static void render_chapter_jump() {
     flush_framebuffer(/*force_full=*/true);
 }
 
+// Bookmark list view: one row per saved bookmark, like chapter-jump but
+// reading from g_bookmarks. Header shows count, each row shows the TOC
+// chapter label (if any) + page number. Tap a row to jump.
+static int bm_first = 0;     // first bookmark visible (for paging)
+static const int BM_ROW_HEIGHT = 56;
+static const int BM_ROWS_PER_PAGE = 7;
+
+static std::string toc_label_for_spine(int spine_index) {
+    std::string best;
+    int best_si = -1;
+    for (size_t i = 0; i < g_toc_cache.size(); ++i) {
+        if (g_toc_cache[i].spine_index <= spine_index &&
+            g_toc_cache[i].spine_index > best_si) {
+            best_si = g_toc_cache[i].spine_index;
+            best = g_toc_cache[i].title;
+        }
+    }
+    return best;
+}
+
+static void render_bookmark_list() {
+    Serial.printf("render_bookmark_list: %u bookmarks\n",
+                  (unsigned)g_bookmarks.size());
+    Serial.flush();
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    int32_t cx = LIST_X, cy = LIST_Y;
+    char header[64];
+    snprintf(header, sizeof(header), "Bookmarks  (%u)",
+             (unsigned)g_bookmarks.size());
+    writeln((GFXfont *)&FiraSans, header, &cx, &cy, framebuffer);
+
+    if (g_bookmarks.empty()) {
+        cx = LIST_X; cy = LIST_Y + 120;
+        writeln((GFXfont *)&FiraSans, "No bookmarks yet.",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy = LIST_Y + 180;
+        writeln((const GFXfont *)&firasans_small,
+                "Tap the top-right corner of a page to add one.",
+                &cx, &cy, framebuffer);
+    } else {
+        int total = (int)g_bookmarks.size();
+        int total_pages = (total + BM_ROWS_PER_PAGE - 1) / BM_ROWS_PER_PAGE;
+        int cur_page = bm_first / BM_ROWS_PER_PAGE;
+        if (total_pages > 1) {
+            char pg[32];
+            snprintf(pg, sizeof(pg), "page %d/%d", cur_page + 1, total_pages);
+            int32_t pgx = EPD_WIDTH - 220, pgy = LIST_Y;
+            writeln((GFXfont *)&FiraSans, pg, &pgx, &pgy, framebuffer);
+        }
+        int rows_shown = (BM_ROWS_PER_PAGE < total - bm_first)
+                       ? BM_ROWS_PER_PAGE : (total - bm_first);
+        for (int row = 0; row < rows_shown; ++row) {
+            int idx = bm_first + row;
+            int32_t cy_row = LIST_Y + 60 + row * BM_ROW_HEIGHT;
+            int sp = g_bookmarks[idx].first;
+            int pg = g_bookmarks[idx].second;
+            std::string label = toc_label_for_spine(sp);
+            if (label.empty()) {
+                char buf[40];
+                snprintf(buf, sizeof(buf), "Section %d", sp + 1);
+                label = buf;
+            }
+            if (label.size() > 40) label = label.substr(0, 37) + "...";
+            char info[12];
+            snprintf(info, sizeof(info), "p %d", pg + 1);
+            int32_t lx = LIST_X + 36, ly = cy_row;
+            writeln((GFXfont *)&FiraSans, label.c_str(), &lx, &ly, framebuffer);
+            // page number, right-aligned
+            int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+            get_text_bounds((GFXfont *)&FiraSans, info, &mx, &my, &mx1,
+                            &my1, &mw, &mh, NULL);
+            int32_t rx = EPD_WIDTH - LIST_X - mw, ry = cy_row;
+            writeln((GFXfont *)&FiraSans, info, &rx, &ry, framebuffer);
+        }
+    }
+
+    flush_framebuffer(/*force_full=*/true);
+}
+
+// Tap → bookmark index, or -1 if outside.
+static int bookmark_hit_test(int16_t x, int16_t y) {
+    if (g_bookmarks.empty()) return -1;
+    int screen_y = EPD_HEIGHT - 1 - y;
+    int rows_top = LIST_Y + 60 - 30;
+    int rows_bot = rows_top + BM_ROWS_PER_PAGE * BM_ROW_HEIGHT;
+    if (screen_y < rows_top || screen_y >= rows_bot) return -1;
+    int row = (screen_y - rows_top) / BM_ROW_HEIGHT;
+    int idx = bm_first + row;
+    if (idx < 0 || idx >= (int)g_bookmarks.size()) return -1;
+    return idx;
+}
+
 // Returns the TOC index that was tapped, or -1 if the tap missed every row.
 // (Caller looks up spine_index + title from g_toc_cache so we can do the
 // title-text search needed for single-spine Gutenberg books.)
@@ -1678,9 +2120,9 @@ static int chapter_jump_hit_test(int16_t x, int16_t y) {
 // any row. Touch Y is inverted relative to render Y, same fix as chapter_jump.
 static int todo_hit_test(int16_t x, int16_t y) {
     int screen_y = EPD_HEIGHT - 1 - y;
-    int rows_top = LIST_Y + 60 - 30;
+    int rows_top = LIST_Y + 100 - 30;   // matches the new header offset
     int row = (screen_y - rows_top) / LINE_HEIGHT;
-    const int max_rows = 8;
+    const int max_rows = 6;
     if (row < 0 || row >= max_rows) return -1;
     if (row >= (int)g_todos.size()) return -1;
     return row;
@@ -1693,30 +2135,29 @@ static void render_todo_list() {
     Serial.flush();
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
 
-    int32_t cx = LIST_X, cy = LIST_Y;
-    char header[64];
-    int n_done = 0;
-    for (const auto &it : g_todos) if (it.done) ++n_done;
-    snprintf(header, sizeof(header), "TODO  (%u/%u done)",
-             (unsigned)n_done, (unsigned)g_todos.size());
-    writeln((GFXfont *)&FiraSans, header, &cx, &cy, framebuffer);
+    // Header: notepad-checkmark logo + "tiny-todo" title (matches the
+    // book-sparkle + "tiny-reader" header on the library page).
+    draw_screen_header(TODO_LOGO_BITMAP, TODO_LOGO_W, TODO_LOGO_H, "tiny-todo");
 
     if (g_todos.empty()) {
-        cx = LIST_X; cy = LIST_Y + 120;
+        int32_t cx = LIST_X, cy = LIST_Y + 100;
         writeln((GFXfont *)&FiraSans, "No TODO items yet.",
                 &cx, &cy, framebuffer);
-        cx = LIST_X; cy = LIST_Y + 180;
-        writeln((GFXfont *)&FiraSans,
+        cx = LIST_X; cy += 50;
+        writeln((const GFXfont *)&firasans_small,
                 "Add some via the hub web UI.",
                 &cx, &cy, framebuffer);
     } else {
-        const int max_rows = 8;
+        const int max_rows = 6;
+        // Indent rows under the header so the checkbox doesn't pull the
+        // eye left of the logo's leftmost inked pixel.
+        const int ROW_INDENT = 28;
         for (size_t i = 0; i < g_todos.size() && (int)i < max_rows; ++i) {
-            int baseline = LIST_Y + 60 + (int)i * LINE_HEIGHT;
+            int baseline = LIST_Y + 100 + (int)i * LINE_HEIGHT;
             // Checkbox sprite to the left of the text.
-            draw_checkbox(LIST_X + 8, baseline - 36, 32,
+            draw_checkbox(LIST_X + ROW_INDENT, baseline - 36, 32,
                           g_todos[i].done, framebuffer);
-            cx = LIST_X + 60; cy = baseline;
+            int32_t cx = LIST_X + ROW_INDENT + 52, cy = baseline;
             std::string line = g_todos[i].text;
             if (line.size() > 54) line = line.substr(0, 51) + "...";
             int32_t text_x_start = cx;
@@ -1730,8 +2171,8 @@ static void render_todo_list() {
             }
         }
         if ((int)g_todos.size() > max_rows) {
-            cx = LIST_X + 60;
-            cy = LIST_Y + 60 + max_rows * LINE_HEIGHT;
+            int32_t cx = LIST_X + ROW_INDENT + 52;
+            int32_t cy = LIST_Y + 100 + max_rows * LINE_HEIGHT;
             char more[40];
             snprintf(more, sizeof(more), "... and %d more (see hub)",
                      (int)g_todos.size() - max_rows);
@@ -1739,7 +2180,7 @@ static void render_todo_list() {
         }
     }
 
-    draw_corner_button("tiny-reader");
+    draw_corner_icon(LOGO_BITMAP, LOGO_W, LOGO_H, 4);
 
     flush_framebuffer(/*force_full=*/true);
 }
@@ -1760,6 +2201,7 @@ static void open_selected() {
     Serial.flush();
 
     current_book_path = std::string("/sd/") + books[selected];
+    load_bookmarks_for_current();
 
     // Try to resume from saved position. If the .pos sidecar also recorded
     // the chapter's page count at save time, scale `saved_pg` to the
@@ -1770,6 +2212,17 @@ static void open_selected() {
     bool resumed = load_position(&saved_ch, &saved_pg, &saved_chap_pages);
 
     if (load_chapter(resumed ? saved_ch : 0)) {
+        // Fresh open: skip front-matter (cover, copyright page, dedication,
+        // ...) by jumping to the first TOC entry's spine, which is normally
+        // chapter 1 of the actual story.
+        if (!resumed && !g_toc_cache.empty()) {
+            int first_toc_spine = g_toc_cache[0].spine_index;
+            if (first_toc_spine > 0 && first_toc_spine < total_spine) {
+                Serial.printf("[OPEN] skip front-matter, jump to TOC[0] sp=%d\n",
+                              first_toc_spine);
+                load_chapter(first_toc_spine);
+            }
+        }
         Serial.printf("Loaded book: spine=%d, chapter has %u pages%s\n",
                       total_spine, (unsigned)chapter_pages.size(),
                       resumed ? " (resumed)" : "");
@@ -2469,14 +2922,71 @@ static void enter_deep_sleep() {
     prefs.end();
 
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
-    int32_t cx = 60, cy = 200;
-    writeln((GFXfont *)&FiraSans, "Sleeping", &cx, &cy, framebuffer);
-    cx = 60; cy = 280;
-    writeln((GFXfont *)&FiraSans,
-            "Press the button to wake.", &cx, &cy, framebuffer);
-    cx = 60; cy = 340;
-    writeln((GFXfont *)&FiraSans,
-            "(Your reading position is saved.)", &cx, &cy, framebuffer);
+
+    // If we were reading a book and have a cached cover thumb, render it
+    // big and centered as the screensaver. e-paper holds the image with
+    // zero power until next wake. Falls back to the plain "Sleeping…"
+    // text if no cover is available.
+    bool drew_cover = false;
+    if (app_mode == MODE_BOOK && selected >= 0 &&
+        selected < (int)books.size()) {
+        String thumb_path = thumb_path_for_name(String(books[selected].c_str()));
+        File tf = SD.open(thumb_path, FILE_READ);
+        if (tf && tf.size() == (long)THUMB_BYTES) {
+            static uint8_t thumb_buf[THUMB_BYTES];
+            tf.read(thumb_buf, THUMB_BYTES);
+            tf.close();
+            // Nearest-neighbor 4x upscale → ~320×440. Centered.
+            const int scale = 4;
+            int big_w = THUMB_W * scale;
+            int big_h = THUMB_H * scale;
+            int sx = (EPD_WIDTH - big_w) / 2;
+            int sy = (EPD_HEIGHT - big_h) / 2 - 20;   // slight upward shift
+            for (int y = 0; y < big_h; ++y) {
+                int srcY = y / scale;
+                for (int x = 0; x < big_w; ++x) {
+                    int srcX = x / scale;
+                    int idx = (srcY * THUMB_W + srcX) / 2;
+                    uint8_t nib = (srcX & 1) ? (thumb_buf[idx] >> 4)
+                                             : (thumb_buf[idx] & 0x0F);
+                    int dx = sx + x, dy = sy + y;
+                    if (dx < 0 || dx >= EPD_WIDTH || dy < 0 || dy >= EPD_HEIGHT)
+                        continue;
+                    int fbidx = (dy * EPD_WIDTH + dx) / 2;
+                    if (dx & 1)
+                        framebuffer[fbidx] = (framebuffer[fbidx] & 0x0F) |
+                                             (nib << 4);
+                    else
+                        framebuffer[fbidx] = (framebuffer[fbidx] & 0xF0) | nib;
+                }
+            }
+            // Title under the cover.
+            const GFXfont *small = (const GFXfont *)&firasans_small;
+            std::string t = books[selected];
+            size_t dot = t.rfind(".epub");
+            if (dot != std::string::npos) t.erase(dot);
+            if (t.size() > 48) t = t.substr(0, 45) + "...";
+            int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+            get_text_bounds(small, t.c_str(), &mx, &my, &mx1, &my1,
+                            &mw, &mh, NULL);
+            int32_t tx = (EPD_WIDTH - mw) / 2;
+            int32_t ty = sy + big_h + 36;
+            writeln(small, t.c_str(), &tx, &ty, framebuffer);
+            drew_cover = true;
+        } else if (tf) {
+            tf.close();
+        }
+    }
+    if (!drew_cover) {
+        int32_t cx = 60, cy = 200;
+        writeln((GFXfont *)&FiraSans, "Sleeping", &cx, &cy, framebuffer);
+        cx = 60; cy = 280;
+        writeln((GFXfont *)&FiraSans,
+                "Press the button to wake.", &cx, &cy, framebuffer);
+        cx = 60; cy = 340;
+        writeln((GFXfont *)&FiraSans,
+                "(Your reading position is saved.)", &cx, &cy, framebuffer);
+    }
     flush_framebuffer(/*force_full=*/true);
 
     // Wait for the button to be released before arming wake — otherwise ext0
@@ -2679,6 +3189,26 @@ void loop() {
                             render_todo_list();
                         }
                     }
+                } else if (app_mode == MODE_BOOKMARK_LIST) {
+                    if (ys[0] > EPD_HEIGHT - 80) {
+                        // Top strip → cancel back to book.
+                        app_mode = MODE_BOOK;
+                        render_book_page();
+                    } else {
+                        int idx = bookmark_hit_test(xs[0], ys[0]);
+                        if (idx >= 0) {
+                            int sp = g_bookmarks[idx].first;
+                            int pg = g_bookmarks[idx].second;
+                            Serial.printf("[BM] jump to (ch=%d p=%d)\n", sp, pg);
+                            if (sp >= 0 && sp < total_spine && load_chapter(sp)) {
+                                if (pg >= 0 && pg < (int)chapter_pages.size())
+                                    current_page_in_chapter = pg;
+                                app_mode = MODE_BOOK;
+                                render_book_page();
+                                save_position();
+                            }
+                        }
+                    }
                 } else if (app_mode == MODE_BOOK_END) {
                     if (xs[0] < EPD_WIDTH / 2 && ys[0] < EPD_HEIGHT - 80) {
                         app_mode = MODE_BOOK;
@@ -2744,8 +3274,21 @@ void loop() {
                     // Touch coord origin is bottom-left of screen, so the
                     // user's *top* strip is high Y, not low Y.
                     bool top_strip = (ys[0] > EPD_HEIGHT - 80);
+                    bool top_right_corner = (xs[0] > EPD_WIDTH - 200 &&
+                                             ys[0] > EPD_HEIGHT - 100);
                     bool bottom_left_corner = (xs[0] < 100 && ys[0] < 80);
-                    if (top_strip) {
+                    bool bottom_right_corner = (xs[0] > EPD_WIDTH - 200 &&
+                                                ys[0] < 100);
+                    if (top_right_corner) {
+                        Serial.println("[TAP] top-right → toggle bookmark");
+                        toggle_bookmark_on_current_page();
+                        render_book_page();
+                    } else if (bottom_right_corner) {
+                        Serial.println("[TAP] bottom-right → bookmark list");
+                        bm_first = 0;
+                        app_mode = MODE_BOOKMARK_LIST;
+                        render_bookmark_list();
+                    } else if (top_strip) {
                         Serial.println("[TAP] top → back to library");
                         app_mode = MODE_LIBRARY;
                         render_book_list();
