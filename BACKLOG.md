@@ -12,11 +12,14 @@ foliate-js, atomic14/diy-esp32-epub-reader, Plato, Inkplate, epdiy.
   `runs[]` array of `{start_offset, length, flags}` where flags is BOLD/ITALIC;
   (b) update `wrap_text` and `render_book_page_text` to switch the font per run.
   Big visual jump.
-- **#18 — Partial refresh + diff framebuffer.** Switch render exit from
-  `epd_draw_grayscale_image` to `epd_hl_update_screen` with `MODE_GL16` for
-  page turns and `MODE_GC16` every 6th turn. Expect ~10× faster turns. Risky
-  if the rendering core path has any bug; do in isolation, with a fallback
-  path. Reference: `epdiy/src/highlevel.c:219-339`.
+- **#18 — Partial refresh + diff framebuffer. (DEFERRED)** Would need
+  vendoring ~1000 lines of epdiy's hi-level API + waveform infrastructure
+  (`epd_hl_update_screen`, mode tables, diff-framebuffer logic). Our
+  LilyGo lib only exposes the low-level `epd_draw_grayscale_image`,
+  which always does a full update. Tried "skip epd_clear() on page
+  turns" as a poor-man's substitute — content layers on top, looks
+  terrible without a true diff path. Park until someone's willing to
+  port epdiy hi-level. Reference: `epdiy/src/highlevel.c:219-339`.
 - **#19 — Locations index in `.pos` sidecar.** Pre-walk each book once, emit
   a stable marker every ~1500 chars. Gives a "page X of Y" that survives
   density changes. Port from foliate-js `progress.js` (~100 lines).

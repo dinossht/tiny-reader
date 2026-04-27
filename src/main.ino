@@ -75,7 +75,17 @@ static int current_spine = 0;
 static int total_spine = 0;
 static int current_page_in_chapter = 0;
 static std::vector<std::string> chapter_pages;  // each entry = one page of \n-separated lines
-static const int BOOK_MARGIN_X = 50;
+// ~8% symmetric page margin — generous enough that italic-glyph overhang
+// (the slanted top of the last glyph on a justified line) doesn't poke
+// past the right edge, no asymmetric reserve needed.
+static const int BOOK_MARGIN_X = 80;
+static const int BODY_RIGHT_RESERVE = 0;
+// First line of each paragraph is rendered with a leading indent. Both
+// wrap_text and render_book_page_text honor it — wrap so the first line
+// fits the indented body width, render so the first line starts at
+// x_start + PARAGRAPH_INDENT. If they disagree the first line of every
+// paragraph protrudes into the right margin.
+static const int PARAGRAPH_INDENT = 40;
 static const int BOOK_TOP_RESERVE = 30;     // small visual margin only
 static const int BOOK_FOOTER_RESERVE = 50;
 // Body font and layout values driven by the user's "density" setting (see
@@ -420,6 +430,13 @@ static inline bool is_style_marker(char c) {
            c == STY_ITALIC_ON || c == STY_ITALIC_OFF;
 }
 
+// Forward decl — defined alongside the renderer; used by wrap_text's
+// measure() so wrap and render see exactly the same word widths.
+static int draw_or_measure_styled_word(const GFXfont *base_font,
+                                       const char *word, int len,
+                                       bool &bold, bool &italic,
+                                       int32_t x, int32_t y, uint8_t *fb);
+
 static std::string strip_xhtml(const char *src, size_t len) {
     std::string out;
     out.reserve(len);
@@ -491,25 +508,61 @@ static std::string strip_xhtml(const char *src, size_t len) {
     return decode_entities(out2);
 }
 
+// Algorithmic hyphenation (vowel-consonant heuristic, KOReader-style).
+// No data file, ~50 lines. Returns a position `pos` in [2, len-2] such that
+// `word[0..pos] + "-"` is a reasonable break point, or -1 if no good break.
+// The latest valid break <= max_pos wins so we fit as much as possible on
+// the current line.
+static inline bool _ah_is_vowel(char c) {
+    c = (char)tolower((unsigned char)c);
+    return c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' || c == 'y';
+}
+static inline bool _ah_is_letter(char c) {
+    c = (char)tolower((unsigned char)c);
+    return c >= 'a' && c <= 'z';
+}
+static int find_hyphen_break(const std::string &word, int max_pos) {
+    int len = (int)word.size();
+    if (len < 6) return -1;
+    if (max_pos > len - 2) max_pos = len - 2;
+    if (max_pos < 2) return -1;
+    for (int pos = max_pos; pos >= 2; --pos) {
+        char a = (char)tolower((unsigned char)word[pos - 1]);
+        char b = (char)tolower((unsigned char)word[pos]);
+        if (!_ah_is_letter(a) || !_ah_is_letter(b)) continue;
+        // Don't split common digraphs / clusters.
+        if ((a == 's' || a == 't' || a == 'p' || a == 'c' ||
+             a == 'g' || a == 'w') && b == 'h') continue;
+        if (a == 'c' && b == 'k') continue;
+        if (a == 'n' && b == 'g') continue;
+        if (a == 'q' && b == 'u') continue;
+        bool va = _ah_is_vowel(a), vb = _ah_is_vowel(b);
+        bool ca = !va, cb = !vb;
+        // Accept V|C ("compu-ter"), C|V ("feel-ings"), or C|C ("but-ter").
+        if ((va && cb) || (ca && vb) || (ca && cb)) {
+            return pos;
+        }
+    }
+    return -1;
+}
+
 // Pixel-width word wrap — measures actual rendered width with the body font
 // so wide chars like M/W don't push lines past the right edge. Preserves
 // paragraph breaks (consecutive \n becomes a blank line in the output).
 static std::vector<std::string> wrap_text(const std::string &text) {
     std::vector<std::string> lines;
-    const int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
+    const int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X - BODY_RIGHT_RESERVE;
     const GFXfont *font = g_body_font;
 
     auto measure = [font](const char *s) -> int {
-        // Strip inline style markers — they're zero-width directives, not
-        // glyphs. Measure with the regular body font; bold variants are
-        // ~5% wider, but using one font for layout keeps wrap stable.
-        std::string t;
-        for (const char *p = s; *p; ++p) {
-            if (!is_style_marker(*p)) t.push_back(*p);
-        }
-        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-        get_text_bounds(font, t.c_str(), &mx, &my, &mx1, &my1, &mw, &mh, NULL);
-        return (int)mw;
+        // Use the same styled walker as render_line so wrap and render
+        // agree byte-for-byte. Style markers are zero-width directives;
+        // each non-marker segment is measured with its style-aware font
+        // (italic glyphs are slightly wider than regular, etc.). Returns
+        // the cursor advance — what writeln will actually skip.
+        bool bold = false, italic = false;
+        return draw_or_measure_styled_word(
+            font, s, (int)strlen(s), bold, italic, 0, 0, nullptr);
     };
 
     std::string para;
@@ -517,6 +570,14 @@ static std::vector<std::string> wrap_text(const std::string &text) {
         if (i == text.size() || text[i] == '\n') {
             std::string current;
             std::string word;
+            // First line of each paragraph is indented at render time, so
+            // it must fit a narrower width (target_w - PARAGRAPH_INDENT).
+            // After the first line is committed, subsequent lines wrap to
+            // the full target_w.
+            bool first_line = true;
+            auto line_max = [&]() {
+                return first_line ? (target_w - PARAGRAPH_INDENT) : target_w;
+            };
             for (size_t j = 0; j <= para.size(); ++j) {
                 char c = (j < para.size()) ? para[j] : ' ';
                 if (c == ' ') {
@@ -525,11 +586,40 @@ static std::vector<std::string> wrap_text(const std::string &text) {
                             current = word;
                         } else {
                             std::string candidate = current + " " + word;
-                            if (measure(candidate.c_str()) <= target_w) {
+                            if (measure(candidate.c_str()) <= line_max()) {
                                 current = std::move(candidate);
                             } else {
-                                lines.push_back(current);
-                                current = word;
+                                // Word doesn't fit. Try to hyphenate: find
+                                // the largest prefix of `word` such that
+                                // `current + " " + prefix + "-"` fits.
+                                int avail = line_max()
+                                          - measure((current + " ").c_str());
+                                int best_pos = -1;
+                                if (avail > 0 && (int)word.size() >= 6) {
+                                    // Walk from longest prefix down.
+                                    for (int pos = (int)word.size() - 2;
+                                         pos >= 2; --pos) {
+                                        int hpos = find_hyphen_break(word, pos);
+                                        if (hpos < 0) break;
+                                        std::string prefix
+                                            = word.substr(0, hpos) + "-";
+                                        if (measure(prefix.c_str()) <= avail) {
+                                            best_pos = hpos;
+                                            break;
+                                        }
+                                        pos = hpos;  // try next-shorter break
+                                    }
+                                }
+                                if (best_pos > 0) {
+                                    std::string prefix
+                                        = word.substr(0, best_pos) + "-";
+                                    lines.push_back(current + " " + prefix);
+                                    current = word.substr(best_pos);
+                                } else {
+                                    lines.push_back(current);
+                                    current = word;
+                                }
+                                first_line = false;
                             }
                         }
                         word.clear();
@@ -931,7 +1021,6 @@ static void render_book_page_text(int x_start, int target_w, int32_t y0, uint8_t
     // Indent first line of each paragraph (book-style). Skip the indent for
     // the *very first* line of the page — that's either a continuation from
     // the previous page or a chapter heading, neither wants an indent.
-    const int PARAGRAPH_INDENT = 40;
     int32_t cy = y0;
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string &line = lines[i];
@@ -1123,6 +1212,11 @@ static void draw_rect_rounded(int x0, int y0, int x1, int y1, int r,
     }
 }
 
+// Bumped on every render and every touch / button event. The loop uses
+// it to decide when it's safe to enter light sleep — long gaps between
+// interactions are fine to nap through.
+static uint32_t g_last_interact_ms = 0;
+
 // Push the current framebuffer to the EPD. Always does an epd_clear()
 // flash first — without it, the e-paper retains previous content and
 // each render layers on top. True diff-based partial refresh would need
@@ -1135,6 +1229,7 @@ static void flush_framebuffer(bool force_full = false) {
     epd_clear();
     epd_draw_grayscale_image(epd_full_screen(), framebuffer);
     epd_poweroff();
+    g_last_interact_ms = millis();
 }
 
 // Right-pointing filled triangle "▶" — used as the selection cursor in the
@@ -1194,7 +1289,7 @@ static void render_book_page() {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
     // (no header strip — body uses the full vertical space; the top 80px is
     // still the tap-back-to-library zone, just invisibly so.)
-    int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
+    int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X - BODY_RIGHT_RESERVE;
     render_book_page_text(BOOK_MARGIN_X, target_w, BOOK_TOP_RESERVE + 30, framebuffer);
 
     // 3-column footer rendered in the smaller font so it occupies less vertical
@@ -1213,8 +1308,11 @@ static void render_book_page() {
     }
     const GFXfont *small = (const GFXfont *)&firasans_small;
     int32_t footer_y = EPD_HEIGHT - 12;
-    // divider just above the footer text
-    draw_hline(EPD_HEIGHT - 42, BOOK_MARGIN_X, EPD_WIDTH - BOOK_MARGIN_X, framebuffer);
+    // divider just above the footer text — match the body's effective right
+    // edge (target_w + BOOK_MARGIN_X) so the line aligns with where text
+    // actually ends, not the raw margin point.
+    draw_hline(EPD_HEIGHT - 42, BOOK_MARGIN_X,
+               EPD_WIDTH - BOOK_MARGIN_X - BODY_RIGHT_RESERVE, framebuffer);
     int batt_pct = read_battery_percent();
 
     // Layout: chapter (left) | page X/Y (center) | battery icon + % (right).
@@ -1247,7 +1345,7 @@ static void render_book_page() {
     // the icon sits 42 px to the left of that, not 42 px past the end.
     int32_t rw, rh_ = 0, rmx = 0, rmy = 0, rmx1, rmy1;
     get_text_bounds(small, right, &rmx, &rmy, &rmx1, &rmy1, &rw, &rh_, NULL);
-    int32_t text_start_x = EPD_WIDTH - BOOK_MARGIN_X - rw;
+    int32_t text_start_x = EPD_WIDTH - BOOK_MARGIN_X - BODY_RIGHT_RESERVE - rw;
     int32_t rx_text = text_start_x, ry = footer_y;
     writeln(small, right, &rx_text, &ry, framebuffer);
     draw_battery_icon(text_start_x - 42, footer_y - 9, batt_pct, framebuffer);
@@ -2553,6 +2651,7 @@ void loop() {
         static bool touch_was_down = false;
         int16_t xs[5], ys[5];
         uint8_t n = touch.getPoint(xs, ys, 1);
+        if (n > 0) g_last_interact_ms = now;
         if (n > 0) {
             if (!touch_was_down && now >= input_cooldown_until) {
                 int zone = classify_tap(xs[0], ys[0]);
@@ -2692,6 +2791,7 @@ void loop() {
     //                                very long press ≥ 5 s = deep sleep (immediate).
     {
         bool down = (digitalRead(BUTTON_1) == LOW);
+        if (down) g_last_interact_ms = now;
         if (down) {
             if (button_press_start == 0) {
                 button_press_start = now;
@@ -2766,5 +2866,10 @@ void loop() {
         }
     }
 
+    // Light sleep was tried here (esp_light_sleep_start with GPIO/timer
+    // wake) but it interacts badly with USB-CDC enumeration during
+    // flashing — esptool fails with OSError 71 when the chip is
+    // sleep-cycling. Detection via `!Serial` wasn't reliable enough.
+    // Leaving the busy-wait for now; deep sleep on long-press still works.
     vTaskDelay(pdMS_TO_TICKS(20));
 }
