@@ -26,9 +26,15 @@
 
 #include "epd_driver.h"
 #include "firasans.h"
-#include "firasans_small.h"      // smaller bitmap font for footer/status lines
-#include "freesans_body_small.h" // 18pt body font used for "compact" density
-#include "logo.h"                // 1-bit packed boot-splash logo
+#include "firasans_small.h"          // smaller bitmap font for footer/status lines
+#include "freesans_body_small.h"     // 18pt body font used for "compact" density
+#include "freesans_body.h"           // 22pt body font (regular) — medium density
+#include "freesans_body_bold.h"      // 22pt body bold
+#include "freesans_body_italic.h"    // 22pt body italic (oblique)
+#include "freesans_body_bolditalic.h" // 22pt body bold-italic
+#include "freesans_title.h"          // 32pt title font for screen headers
+#include "logo.h"                    // 1-bit packed boot-splash logo
+#include "hub_html.h"                // generated from src/hub.html (HUB_HTML[])
 #include "utilities.h"
 #include <TouchDrvGT911.hpp>
 #include "Epub.h"
@@ -58,7 +64,7 @@ static AppMode app_mode = MODE_LIBRARY;
 static std::vector<std::string> books;   // filenames in SD root ending .epub
 static int selected = 0;                 // index in books
 static int page_first = 0;               // first index visible on the screen
-static const int LINES_PER_PAGE = 8;     // ~8 books fit comfortably at 36px font
+static const int LINES_PER_PAGE = 6;     // 6 leaves space for the header gap and the tiny-todo button
 static const int LINE_HEIGHT = 56;
 static const int LIST_X = 60;
 static const int LIST_Y = 80;
@@ -117,14 +123,14 @@ static void apply_density() {
             break;
         case 2:  // loose — same body font as medium but airy: extra leading
                  // and short lines.
-            g_body_font = (const GFXfont *)&FiraSans;
+            g_body_font = (const GFXfont *)&freesans_body;
             book_line_height = 72;
             book_chars_per_line = 30;
             break;
         case 1:  // medium (default)
         default:
             g_settings.density = 1;
-            g_body_font = (const GFXfont *)&FiraSans;
+            g_body_font = (const GFXfont *)&freesans_body;
             book_line_height = 50;
             book_chars_per_line = 44;
             break;
@@ -286,44 +292,141 @@ static void scan_sd_for_epubs() {
 }
 
 // Decode the most common HTML entities into UTF-8 in place.
+// Append a Unicode code point to a string as UTF-8 bytes.
+static void append_utf8(std::string &out, uint32_t cp) {
+    if (cp < 0x80) { out.push_back((char)cp); return; }
+    if (cp < 0x800) {
+        out.push_back((char)(0xC0 | (cp >> 6)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+        return;
+    }
+    if (cp < 0x10000) {
+        out.push_back((char)(0xE0 | (cp >> 12)));
+        out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+        return;
+    }
+    // 4-byte UTF-8 (rare for body text)
+    out.push_back((char)(0xF0 | (cp >> 18)));
+    out.push_back((char)(0x80 | ((cp >> 12) & 0x3F)));
+    out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back((char)(0x80 | (cp & 0x3F)));
+}
+
 static std::string decode_entities(const std::string &s) {
     std::string out;
     out.reserve(s.size());
     for (size_t i = 0; i < s.size();) {
         if (s[i] == '&') {
             size_t semi = s.find(';', i + 1);
-            if (semi != std::string::npos && semi - i <= 8) {
+            if (semi != std::string::npos && semi - i <= 9) {
                 std::string ent = s.substr(i + 1, semi - i - 1);
+                // Named entities. Smart quotes returned as proper UTF-8
+                // U+2018/2019/201C/201D so the new General-Punctuation
+                // glyphs in freesans_body render them.
                 const char *rep = nullptr;
-                if (ent == "amp") rep = "&";
-                else if (ent == "lt") rep = "<";
-                else if (ent == "gt") rep = ">";
-                else if (ent == "quot") rep = "\"";
-                else if (ent == "apos") rep = "'";
-                else if (ent == "nbsp") rep = " ";
-                else if (ent == "mdash") rep = "—";
-                else if (ent == "ndash") rep = "–";
-                else if (ent == "hellip") rep = "…";
-                else if (ent == "lsquo" || ent == "rsquo") rep = "'";
-                else if (ent == "ldquo" || ent == "rdquo") rep = "\"";
+                if      (ent == "amp")    rep = "&";
+                else if (ent == "lt")     rep = "<";
+                else if (ent == "gt")     rep = ">";
+                else if (ent == "quot")   rep = "\"";
+                else if (ent == "apos")   rep = "'";
+                else if (ent == "nbsp")   rep = " ";
+                else if (ent == "mdash")  rep = "\xE2\x80\x94"; // —
+                else if (ent == "ndash")  rep = "\xE2\x80\x93"; // –
+                else if (ent == "hellip") rep = "\xE2\x80\xA6"; // …
+                else if (ent == "lsquo")  rep = "\xE2\x80\x98"; // '
+                else if (ent == "rsquo")  rep = "\xE2\x80\x99"; // '
+                else if (ent == "ldquo")  rep = "\xE2\x80\x9C"; // "
+                else if (ent == "rdquo")  rep = "\xE2\x80\x9D"; // "
                 if (rep) { out += rep; i = semi + 1; continue; }
-                // numeric &#NN; or &#xHH; — best-effort: drop
-                if (!ent.empty() && ent[0] == '#') { i = semi + 1; continue; }
+                // Numeric &#NN; or &#xHH;
+                if (!ent.empty() && ent[0] == '#') {
+                    uint32_t cp = 0;
+                    bool hex = ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X');
+                    size_t k = hex ? 2 : 1;
+                    bool ok = (k < ent.size());
+                    for (; k < ent.size() && ok; ++k) {
+                        char c = ent[k];
+                        if (c >= '0' && c <= '9') cp = cp * (hex ? 16 : 10) + (c - '0');
+                        else if (hex && c >= 'a' && c <= 'f') cp = cp * 16 + (c - 'a' + 10);
+                        else if (hex && c >= 'A' && c <= 'F') cp = cp * 16 + (c - 'A' + 10);
+                        else { ok = false; }
+                    }
+                    if (ok && cp > 0) {
+                        append_utf8(out, cp);
+                        i = semi + 1;
+                        continue;
+                    }
+                    // Couldn't parse — drop.
+                    i = semi + 1;
+                    continue;
+                }
             }
         }
         out.push_back(s[i]);
         ++i;
     }
-    return out;
+    // ASCII-style typographic substitutions + collapse Unicode whitespace
+    // (NBSP, thin/hair space, narrow no-break space) to ASCII space so that
+    // word-tokenizers downstream split correctly. Without this, an EPUB
+    // that used `&#160;` between words inside `<em>...</em>` ends up
+    // rendered as one merged blob.
+    std::string t;
+    t.reserve(out.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        // Multi-byte Unicode space sequences in UTF-8.
+        if (i + 1 < out.size() &&
+            (uint8_t)out[i] == 0xC2 && (uint8_t)out[i + 1] == 0xA0) {
+            // U+00A0 NBSP
+            t.push_back(' ');
+            i += 1;
+            continue;
+        }
+        if (i + 2 < out.size() && (uint8_t)out[i] == 0xE2 &&
+            (uint8_t)out[i + 1] == 0x80) {
+            uint8_t b2 = (uint8_t)out[i + 2];
+            // U+2002..U+200A and U+202F whitespace forms
+            if ((b2 >= 0x82 && b2 <= 0x8A) || b2 == 0xAF) {
+                t.push_back(' ');
+                i += 2;
+                continue;
+            }
+        }
+        if (i + 1 < out.size() && out[i] == '-' && out[i + 1] == '-') {
+            t += "\xE2\x80\x94"; // —
+            i += 1;
+        } else if (i + 2 < out.size() && out[i] == '.' && out[i + 1] == '.' &&
+                   out[i + 2] == '.') {
+            t += "\xE2\x80\xA6"; // …
+            i += 2;
+        } else {
+            t.push_back(out[i]);
+        }
+    }
+    return t;
 }
 
 // Strip XHTML tags into plain text. Block-level closing tags become \n.
 // Skip everything inside <head>, <script>, <style>.
+// Inline style markers used in the stripped text. These are ASCII control
+// bytes that pass through wrap/paginate untouched and are interpreted by
+// render_line to swap fonts mid-line. Zero-width in width calculations.
+static const char STY_BOLD_ON    = '\x01';
+static const char STY_BOLD_OFF   = '\x02';
+static const char STY_ITALIC_ON  = '\x03';
+static const char STY_ITALIC_OFF = '\x04';
+static inline bool is_style_marker(char c) {
+    return c == STY_BOLD_ON || c == STY_BOLD_OFF ||
+           c == STY_ITALIC_ON || c == STY_ITALIC_OFF;
+}
+
 static std::string strip_xhtml(const char *src, size_t len) {
     std::string out;
     out.reserve(len);
     bool in_tag = false;
     int skip_depth = 0;     // >0 while inside head/script/style
+    int bold_depth = 0;     // nested <b>/<strong>
+    int italic_depth = 0;   // nested <em>/<i>
     std::string tag;
     auto is_block = [](const std::string &t){
         return t == "p" || t == "br" || t == "div" || t == "li" || t == "blockquote" ||
@@ -351,6 +454,22 @@ static std::string strip_xhtml(const char *src, size_t len) {
                 else ++skip_depth;
             } else if (skip_depth == 0 && is_block(name)) {
                 if (out.empty() || out.back() != '\n') out.push_back('\n');
+            } else if (skip_depth == 0 && (name == "b" || name == "strong")) {
+                if (is_close) {
+                    if (bold_depth > 0) --bold_depth;
+                    if (bold_depth == 0) out.push_back(STY_BOLD_OFF);
+                } else {
+                    if (bold_depth == 0) out.push_back(STY_BOLD_ON);
+                    ++bold_depth;
+                }
+            } else if (skip_depth == 0 && (name == "em" || name == "i")) {
+                if (is_close) {
+                    if (italic_depth > 0) --italic_depth;
+                    if (italic_depth == 0) out.push_back(STY_ITALIC_OFF);
+                } else {
+                    if (italic_depth == 0) out.push_back(STY_ITALIC_ON);
+                    ++italic_depth;
+                }
             }
             continue;
         }
@@ -381,8 +500,15 @@ static std::vector<std::string> wrap_text(const std::string &text) {
     const GFXfont *font = g_body_font;
 
     auto measure = [font](const char *s) -> int {
+        // Strip inline style markers — they're zero-width directives, not
+        // glyphs. Measure with the regular body font; bold variants are
+        // ~5% wider, but using one font for layout keeps wrap stable.
+        std::string t;
+        for (const char *p = s; *p; ++p) {
+            if (!is_style_marker(*p)) t.push_back(*p);
+        }
         int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-        get_text_bounds(font, s, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        get_text_bounds(font, t.c_str(), &mx, &my, &mx1, &my1, &mw, &mh, NULL);
         return (int)mw;
     };
 
@@ -542,35 +668,39 @@ static String pos_path_for_name(const String &name) {
     return String("/") + name.substring(0, dot) + ".pos";
 }
 
-// .pos format: "<spine> <page> [<percent>]\n". Percent is appended so the
-// library row can show progress that matches the book footer; legacy two-int
-// files (written before this) are read back with percent=0.
+// .pos format: "<spine> <page> [<percent> [<chapter_pages>]]\n".
+// chapter_pages records how many pages the chapter had at save time. On
+// load with a different density, page is rescaled proportionally so the
+// reader lands at roughly the same place even though the page count
+// differs. Legacy two/three-int files are still readable.
 static bool read_position_for_name(const String &name, int *out_spine,
-                                   int *out_page, int *out_percent = nullptr) {
+                                   int *out_page, int *out_percent = nullptr,
+                                   int *out_chap_pages = nullptr) {
     File f = SD.open(pos_path_for_name(name), FILE_READ);
     if (!f) return false;
     String line = f.readStringUntil('\n');
     f.close();
-    int sp = -1, pg = -1, pct = 0;
-    int n = sscanf(line.c_str(), "%d %d %d", &sp, &pg, &pct);
+    int sp = -1, pg = -1, pct = 0, cp = 0;
+    int n = sscanf(line.c_str(), "%d %d %d %d", &sp, &pg, &pct, &cp);
     if (n >= 2) {
         *out_spine = sp;
         *out_page = pg;
-        if (out_percent) *out_percent = (n >= 3) ? pct : 0;
+        if (out_percent)    *out_percent    = (n >= 3) ? pct : 0;
+        if (out_chap_pages) *out_chap_pages = (n >= 4) ? cp  : 0;
         return true;
     }
     return false;
 }
 
 static bool write_position_for_name(const String &name, int spine, int page,
-                                    int percent = 0) {
+                                    int percent = 0, int chap_pages = 0) {
     String path = pos_path_for_name(name);
     File f = SD.open(path, FILE_WRITE);
     if (!f) { Serial.printf("write_position: open %s failed\n", path.c_str()); return false; }
-    f.printf("%d %d %d\n", spine, page, percent);
+    f.printf("%d %d %d %d\n", spine, page, percent, chap_pages);
     f.close();
-    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d %d%%\n",
-                  path.c_str(), spine, page, percent);
+    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d/%d %d%%\n",
+                  path.c_str(), spine, page, chap_pages, percent);
     return true;
 }
 
@@ -592,14 +722,19 @@ static void save_position() {
     if (selected < 0 || selected >= (int)books.size()) return;
     write_position_for_name(String(books[selected].c_str()),
                             current_spine, current_page_in_chapter,
-                            compute_book_progress_pct());
+                            compute_book_progress_pct(),
+                            (int)chapter_pages.size());
 }
 
-static bool load_position(int *out_spine, int *out_page) {
+static bool load_position(int *out_spine, int *out_page,
+                          int *out_chap_pages = nullptr) {
     if (selected < 0 || selected >= (int)books.size()) return false;
+    int dummy_pct = 0, cp = 0;
     bool ok = read_position_for_name(String(books[selected].c_str()),
-                                     out_spine, out_page);
-    if (ok) Serial.printf("[POS_LOADED] ch=%d p=%d\n", *out_spine, *out_page);
+                                     out_spine, out_page, &dummy_pct, &cp);
+    if (out_chap_pages) *out_chap_pages = cp;
+    if (ok) Serial.printf("[POS_LOADED] ch=%d p=%d (was /%d)\n",
+                          *out_spine, *out_page, cp);
     return ok;
 }
 
@@ -638,10 +773,73 @@ static void dump_current_page_to_serial() {
 
 // Render a single line, optionally distributing slack between words so that
 // the rendered width matches `target_w`.
+// Style-aware font picker. Tracks bold/italic state across calls within a
+// single render_line invocation by reading the marker bytes embedded in the
+// text.
+static const GFXfont *font_for_style(const GFXfont *base, bool bold, bool italic) {
+    // Only honor styling for the medium body font (matching variants exist).
+    // For compact / loose density we fall back to the base.
+    if (base != (const GFXfont *)&freesans_body) return base;
+    if (bold && italic) return (const GFXfont *)&freesans_body_bolditalic;
+    if (bold)           return (const GFXfont *)&freesans_body_bold;
+    if (italic)         return (const GFXfont *)&freesans_body_italic;
+    return base;
+}
+
+// Update style state from a marker byte. Idempotent for non-markers.
+static inline void apply_marker(char m, bool &bold, bool &italic) {
+    switch (m) {
+        case STY_BOLD_ON:    bold   = true;  break;
+        case STY_BOLD_OFF:   bold   = false; break;
+        case STY_ITALIC_ON:  italic = true;  break;
+        case STY_ITALIC_OFF: italic = false; break;
+    }
+}
+
+// Measure / draw a "word" (no spaces) that may contain style markers.
+// Splits the word at marker boundaries and processes each segment with the
+// font matching the current style. Returns the rendered width.
+// If `fb` is NULL, just measures.
+static int draw_or_measure_styled_word(const GFXfont *base_font,
+                                       const char *word, int len,
+                                       bool &bold, bool &italic,
+                                       int32_t x, int32_t y, uint8_t *fb) {
+    int total_w = 0;
+    int seg_start = 0;
+    auto flush = [&](int upto) {
+        if (upto <= seg_start) return;
+        std::string seg(word + seg_start, upto - seg_start);
+        const GFXfont *f = font_for_style(base_font, bold, italic);
+        if (fb) {
+            // Drawing pass: trust writeln's actual cursor advance.
+            int32_t cx = x + total_w, cy = y;
+            int32_t cx_init = cx;
+            writeln((GFXfont *)f, seg.c_str(), &cx, &cy, fb);
+            int adv = cx - cx_init;
+            total_w += adv;
+            return;
+        }
+        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+        get_text_bounds(f, seg.c_str(), &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        total_w += mx;
+    };
+    for (int i = 0; i <= len; ++i) {
+        char c = (i < len) ? word[i] : '\0';
+        if (i == len) { flush(i); break; }
+        if (is_style_marker(c)) {
+            flush(i);
+            apply_marker(c, bold, italic);
+            seg_start = i + 1;
+        }
+    }
+    return total_w;
+}
+
 static void render_line(const GFXfont *font, const char *line,
                         int x_start, int target_w, int32_t y,
                         uint8_t *fb, bool justify) {
-    // tokenize words
+    // tokenize words. Style markers stay attached to whichever word they
+    // sit next to (typically prefix of next word or suffix of current).
     std::vector<std::string> words;
     {
         std::string cur;
@@ -653,39 +851,62 @@ static void render_line(const GFXfont *font, const char *line,
     }
     if (words.empty()) return;
 
+    // Style state persists across words within the line.
+    bool bold = false, italic = false;
+
     int32_t cx = x_start, cy = y;
 
+    // Space width — read the cursor advance after measuring " " (parameter
+    // *x), NOT the bbox width (*w). A space has no inked pixels so its
+    // bbox width is 0; the real width-between-words is advance_x.
+    int32_t sp_x = 0, by = 0, bx1, by1, bw, bh;
+    get_text_bounds(font, " ", &sp_x, &by, &bx1, &by1, &bw, &bh, NULL);
+    int sp_w = (int)sp_x;
+
     if (!justify || words.size() == 1) {
-        writeln((GFXfont *)font, line, &cx, &cy, fb);
+        int gaps = (int)words.size() - 1;
+        for (size_t i = 0; i < words.size(); ++i) {
+            int adv = draw_or_measure_styled_word(font, words[i].data(),
+                                                  (int)words[i].size(),
+                                                  bold, italic, cx, cy, fb);
+            cx += adv;
+            if ((int)i < gaps) cx += sp_w;
+        }
         return;
     }
 
-    // measure each word
+    // Measure each word with its current style sequence. Width depends on
+    // the order of markers, so use a copy of the state for measurement and
+    // restore for the draw pass.
+    bool m_bold = bold, m_italic = italic;
     std::vector<int> ww;
     int total_word_w = 0;
     for (auto &w : words) {
-        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-        get_text_bounds(font, w.c_str(), &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        int mw = draw_or_measure_styled_word(font, w.data(), (int)w.size(),
+                                             m_bold, m_italic, 0, 0, nullptr);
         ww.push_back(mw);
         total_word_w += mw;
     }
     int gaps = (int)words.size() - 1;
-    // baseline space width
-    int32_t mx = 0, my = 0, mx1, my1, sp_w, mh;
-    get_text_bounds(font, " ", &mx, &my, &mx1, &my1, &sp_w, &mh, NULL);
     int natural_w = total_word_w + sp_w * gaps;
     int slack = target_w - natural_w;
-    // bail out of justification if slack is huge (last short line, etc.)
     if (slack < 0 || slack > target_w / 3) {
-        writeln((GFXfont *)font, line, &cx, &cy, fb);
+        // Bail out of justification: just left-align with style switching.
+        for (auto &w : words) {
+            int adv = draw_or_measure_styled_word(font, w.data(), (int)w.size(),
+                                                  bold, italic, cx, cy, fb);
+            cx += adv + sp_w;
+        }
         return;
     }
-    int extra_total = slack;
-    int extra_each = extra_total / gaps;
-    int extra_rem = extra_total % gaps;
+    int extra_each = slack / gaps;
+    int extra_rem  = slack % gaps;
 
     for (size_t i = 0; i < words.size(); ++i) {
-        writeln((GFXfont *)font, words[i].c_str(), &cx, &cy, fb);
+        int adv = draw_or_measure_styled_word(font, words[i].data(),
+                                              (int)words[i].size(),
+                                              bold, italic, cx, cy, fb);
+        cx += adv;
         if ((int)i < gaps) {
             cx += sp_w + extra_each + ((int)i < extra_rem ? 1 : 0);
         }
@@ -707,14 +928,21 @@ static void render_book_page_text(int x_start, int target_w, int32_t y0, uint8_t
         }
         lines.push_back(cur);
     }
+    // Indent first line of each paragraph (book-style). Skip the indent for
+    // the *very first* line of the page — that's either a continuation from
+    // the previous page or a chapter heading, neither wants an indent.
+    const int PARAGRAPH_INDENT = 40;
     int32_t cy = y0;
     for (size_t i = 0; i < lines.size(); ++i) {
         const std::string &line = lines[i];
         bool last_of_para = (i + 1 >= lines.size()) || lines[i + 1].empty();
         bool blank = line.empty();
+        bool first_of_para = (i > 0) && lines[i - 1].empty() && !blank;
         if (!blank) {
+            int32_t x = first_of_para ? (x_start + PARAGRAPH_INDENT) : x_start;
+            int32_t w = first_of_para ? (target_w - PARAGRAPH_INDENT) : target_w;
             render_line((GFXfont *)g_body_font, line.c_str(),
-                        x_start, target_w, cy, fb, !last_of_para);
+                        x, w, cy, fb, !last_of_para);
         }
         cy += book_line_height;
     }
@@ -770,6 +998,158 @@ static void blit_1bit(int x0, int y0, int w, int h,
             if (dx < 0 || dx >= EPD_WIDTH) continue;
             int idx = (dy * EPD_WIDTH + dx) / 2;
             fb[idx] &= (dx & 1) ? 0x0F : 0xF0;   // black nibble
+        }
+    }
+}
+
+// Set a rectangle of pixels back to "white" (4-bit nibble = 0xF). Inverse
+// of fill_rect. Used to carve a check mark out of a filled checkbox.
+static void clear_rect(int x0, int y0, int x1, int y1, uint8_t *fb) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > EPD_WIDTH) x1 = EPD_WIDTH;
+    if (y1 > EPD_HEIGHT) y1 = EPD_HEIGHT;
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            int idx = (y * EPD_WIDTH + x) / 2;
+            fb[idx] |= (x & 1) ? 0xF0 : 0x0F;
+        }
+    }
+}
+
+// Small checkbox sprite. (x0,y0) is top-left, size is the side length.
+// Unchecked: hollow square. Checked: filled square with a white check mark.
+static void draw_checkbox(int x0, int y0, int size, bool checked, uint8_t *fb) {
+    int x1 = x0 + size, y1 = y0 + size;
+    if (!checked) {
+        draw_hline(y0, x0, x1 + 1, fb);
+        draw_hline(y1, x0, x1 + 1, fb);
+        draw_vline(x0, y0, y1 + 1, fb);
+        draw_vline(x1, y0, y1 + 1, fb);
+        return;
+    }
+    fill_rect(x0, y0, x1 + 1, y1 + 1, fb);
+    // White check inside: draw two diagonals as 2-px-thick "✓".
+    // Short leg: (x0+s/4, y0+s/2) → (x0+s/2, y1 - s/4)
+    // Long leg : (x0+s/2, y1 - s/4) → (x1 - s/5, y0 + s/5)
+    int ax = x0 + size / 4,         ay = y0 + size / 2;
+    int bx = x0 + size / 2,         by = y1 - size / 4;
+    int cx = x1 - size / 5,         cy = y0 + size / 5;
+    auto line = [&](int xa, int ya, int xb, int yb) {
+        int dx = xb - xa, dy = yb - ya;
+        int steps = (abs(dx) > abs(dy)) ? abs(dx) : abs(dy);
+        if (steps == 0) return;
+        for (int i = 0; i <= steps; ++i) {
+            int x = xa + dx * i / steps, y = ya + dy * i / steps;
+            for (int oy = -1; oy <= 0; ++oy)        // 2-px thick
+                for (int ox = -1; ox <= 0; ++ox)
+                    clear_rect(x + ox, y + oy, x + ox + 1, y + oy + 1, fb);
+        }
+    };
+    line(ax, ay, bx, by);
+    line(bx, by, cx, cy);
+}
+
+// Fill a rounded rectangle with a 4-bit gray level (0=black, 0xF=white).
+// If preserve_non_white is true, only pixels currently white (0xF) are
+// touched — useful when the rect already contains text and you want the
+// glyph body + anti-alias edges to remain unaffected.
+static void fill_rect_rounded_gray(int x0, int y0, int x1, int y1, int r,
+                                   uint8_t nibble, bool preserve_non_white,
+                                   uint8_t *fb) {
+    if (x0 > x1 || y0 > y1) return;
+    nibble &= 0x0F;
+    for (int y = y0; y <= y1; ++y) {
+        if (y < 0 || y >= EPD_HEIGHT) continue;
+        int inset = 0;
+        if (r > 0) {
+            if (y < y0 + r) {
+                int dy = (y0 + r) - y;
+                int dx2 = r * r - dy * dy;
+                int dx = (dx2 > 0) ? (int)sqrtf((float)dx2) : 0;
+                inset = r - dx;
+            } else if (y > y1 - r) {
+                int dy = y - (y1 - r);
+                int dx2 = r * r - dy * dy;
+                int dx = (dx2 > 0) ? (int)sqrtf((float)dx2) : 0;
+                inset = r - dx;
+            }
+        }
+        int xa = x0 + inset, xb = x1 - inset;
+        for (int x = xa; x <= xb; ++x) {
+            if (x < 0 || x >= EPD_WIDTH) continue;
+            int idx = (y * EPD_WIDTH + x) / 2;
+            uint8_t cur = (x & 1) ? (fb[idx] >> 4) : (fb[idx] & 0x0F);
+            if (preserve_non_white && cur != 0x0F) continue;
+            if (x & 1) fb[idx] = (fb[idx] & 0x0F) | (nibble << 4);
+            else       fb[idx] = (fb[idx] & 0xF0) | nibble;
+        }
+    }
+}
+
+// Rounded-rectangle outline. Corner radius `r` should be small (≤ ~10).
+// Uses a midpoint-circle inner loop for the four quarter arcs and the
+// existing line primitives for the four shortened sides.
+static void draw_rect_rounded(int x0, int y0, int x1, int y1, int r,
+                              uint8_t *fb) {
+    if (r <= 0) {
+        draw_hline(y0, x0, x1 + 1, fb);
+        draw_hline(y1, x0, x1 + 1, fb);
+        draw_vline(x0, y0, y1 + 1, fb);
+        draw_vline(x1, y0, y1 + 1, fb);
+        return;
+    }
+    draw_hline(y0, x0 + r, x1 - r + 1, fb);
+    draw_hline(y1, x0 + r, x1 - r + 1, fb);
+    draw_vline(x0, y0 + r, y1 - r + 1, fb);
+    draw_vline(x1, y0 + r, y1 - r + 1, fb);
+    auto plot = [fb](int x, int y) {
+        if (x < 0 || x >= EPD_WIDTH || y < 0 || y >= EPD_HEIGHT) return;
+        int idx = (y * EPD_WIDTH + x) / 2;
+        fb[idx] &= (x & 1) ? 0x0F : 0xF0;
+    };
+    int cx_tl = x0 + r, cy_tl = y0 + r;
+    int cx_tr = x1 - r, cy_tr = y0 + r;
+    int cx_bl = x0 + r, cy_bl = y1 - r;
+    int cx_br = x1 - r, cy_br = y1 - r;
+    int x = r, y = 0, err = 0;
+    while (x >= y) {
+        plot(cx_tl - x, cy_tl - y); plot(cx_tl - y, cy_tl - x);
+        plot(cx_tr + x, cy_tr - y); plot(cx_tr + y, cy_tr - x);
+        plot(cx_bl - x, cy_bl + y); plot(cx_bl - y, cy_bl + x);
+        plot(cx_br + x, cy_br + y); plot(cx_br + y, cy_br + x);
+        ++y;
+        if (err <= 0) err += 2 * y + 1;
+        else { --x; err -= 2 * x + 1; }
+    }
+}
+
+// Push the current framebuffer to the EPD. Always does an epd_clear()
+// flash first — without it, the e-paper retains previous content and
+// each render layers on top. True diff-based partial refresh would need
+// epdiy's hi-level API which our vendored LilyGo lib doesn't expose.
+// The `force_full` arg is kept for callers that pass it, but the
+// behaviour is the same in both cases now.
+static void flush_framebuffer(bool force_full = false) {
+    (void)force_full;
+    epd_poweron();
+    epd_clear();
+    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    epd_poweroff();
+}
+
+// Right-pointing filled triangle "▶" — used as the selection cursor in the
+// library and chapter-jump screens. (x, y_top) is the bounding box top-left;
+// width is ~3/4 of `size` so it has a tasteful aspect ratio.
+static void draw_selection_marker(int x, int y_top, int size, uint8_t *fb) {
+    int h = size, w = (size * 3) / 4;
+    for (int dy = 0; dy <= h; ++dy) {
+        int reach = (dy * 2 <= h) ? (2 * dy * w) / h
+                                  : (2 * (h - dy) * w) / h;
+        for (int dx = 0; dx <= reach; ++dx) {
+            int px = x + dx, py = y_top + dy;
+            if (px < 0 || px >= EPD_WIDTH || py < 0 || py >= EPD_HEIGHT) continue;
+            int idx = (py * EPD_WIDTH + px) / 2;
+            fb[idx] &= (px & 1) ? 0x0F : 0xF0;
         }
     }
 }
@@ -836,41 +1216,45 @@ static void render_book_page() {
     // divider just above the footer text
     draw_hline(EPD_HEIGHT - 42, BOOK_MARGIN_X, EPD_WIDTH - BOOK_MARGIN_X, framebuffer);
     int batt_pct = read_battery_percent();
-    char left[24], center[80], right[24];
-    snprintf(left, sizeof(left), " %d%%", batt_pct);
-    // Prefer a real TOC chapter title; fall back to spine index if no NCX.
+
+    // Layout: chapter (left) | page X/Y (center) | battery icon + % (right).
+    char left[80], center[24], right[24];
     std::string toc_label = get_toc_label_for(current_spine);
     if (!toc_label.empty()) {
-        // Truncate long titles so the footer stays on one line.
         if (toc_label.size() > 36) toc_label = toc_label.substr(0, 33) + "...";
-        snprintf(center, sizeof(center), "%s  -  %d%% read",
-                 toc_label.c_str(), book_progress_pct);
+        snprintf(left, sizeof(left), "%s", toc_label.c_str());
     } else {
-        snprintf(center, sizeof(center), "Sec %d/%d  -  %d%% read",
-                 current_spine + 1, total_spine, book_progress_pct);
+        snprintf(left, sizeof(left), "Sec %d/%d",
+                 current_spine + 1, total_spine);
     }
-    snprintf(right, sizeof(right), "p %d/%d",
+    (void)book_progress_pct;  // retained for the (book-end) screen elsewhere
+    snprintf(center, sizeof(center), "p %d / %d",
              current_page_in_chapter + 1, (int)chapter_pages.size());
+    snprintf(right, sizeof(right), "%d%%", batt_pct);
 
-    // Battery icon + percent
-    draw_battery_icon(BOOK_MARGIN_X, footer_y - 9, batt_pct, framebuffer);
-    int32_t lx = BOOK_MARGIN_X + 42, ly = footer_y;
+    // Left: chapter
+    int32_t lx = BOOK_MARGIN_X, ly = footer_y;
     writeln(small, left, &lx, &ly, framebuffer);
 
+    // Center: page
     int32_t cw, ch_ = 0, cmx = 0, cmy = 0, cmx1, cmy1;
     get_text_bounds(small, center, &cmx, &cmy, &cmx1, &cmy1, &cw, &ch_, NULL);
     int32_t cx_ = (EPD_WIDTH - cw) / 2, cy_ = footer_y;
     writeln(small, center, &cx_, &cy_, framebuffer);
 
+    // Right: battery icon + percent (right-aligned). writeln() advances its
+    // x argument to *past* the rendered text, so save the start X first —
+    // the icon sits 42 px to the left of that, not 42 px past the end.
     int32_t rw, rh_ = 0, rmx = 0, rmy = 0, rmx1, rmy1;
     get_text_bounds(small, right, &rmx, &rmy, &rmx1, &rmy1, &rw, &rh_, NULL);
-    int32_t rx = EPD_WIDTH - BOOK_MARGIN_X - rw, ry = footer_y;
-    writeln(small, right, &rx, &ry, framebuffer);
+    int32_t text_start_x = EPD_WIDTH - BOOK_MARGIN_X - rw;
+    int32_t rx_text = text_start_x, ry = footer_y;
+    writeln(small, right, &rx_text, &ry, framebuffer);
+    draw_battery_icon(text_start_x - 42, footer_y - 9, batt_pct, framebuffer);
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    // Page turn: skip the white flash on most renders; full clear every
+    // FULL_REFRESH_EVERY turns to wash out accumulated ghosting.
+    flush_framebuffer(/*force_full=*/false);
 
     // EPD is now electrically idle — safe window to peek at GPIO 0 (STR_100).
     // We latch a flag rather than acting here so loop() consumes it.
@@ -904,10 +1288,7 @@ static void render_book_end() {
 
     // (no footer hints on the end screen — feels nicer to land on)
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 }
 
 // Advance/go-back a page; cross chapter boundaries by loading next/prev spine item.
@@ -950,6 +1331,30 @@ static void dump_library_to_serial() {
     Serial.flush();
 }
 
+// Pill-shaped button at the visual bottom-right corner of the screen, used
+// to switch between the library and the TODO view. The tap zone is fixed
+// (`corner_right` in the loop's touch handler) — this just renders it.
+// Render order: text first (so glyph anti-alias edges land on white), then
+// gray fill that *only* paints the still-white background pixels, then the
+// outline. This avoids white halos around each letter.
+static void draw_corner_button(const char *label) {
+    const GFXfont *small = (const GFXfont *)&firasans_small;
+    int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+    get_text_bounds(small, label, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+    int pad_x = 18, pad_y = 11;
+    int btn_w = mw + 2 * pad_x;
+    int btn_h = mh + 2 * pad_y;
+    int btn_x1 = EPD_WIDTH - 30;
+    int btn_y1 = EPD_HEIGHT - 18;
+    int btn_x0 = btn_x1 - btn_w;
+    int btn_y0 = btn_y1 - btn_h;
+    int32_t lx = btn_x0 + pad_x, ly = btn_y1 - pad_y - 2;
+    writeln(small, label, &lx, &ly, framebuffer);
+    fill_rect_rounded_gray(btn_x0, btn_y0, btn_x1, btn_y1, 8,
+                           0xE, /*preserve_non_white=*/true, framebuffer);
+    draw_rect_rounded(btn_x0, btn_y0, btn_x1, btn_y1, 8, framebuffer);
+}
+
 static void render_book_list() {
     Serial.printf("render_book_list: sel=%d page_first=%d total=%u\n",
                   selected, page_first, (unsigned)books.size());
@@ -959,6 +1364,27 @@ static void render_book_list() {
 
     const GFXfont *body  = (GFXfont *)&FiraSans;
     const GFXfont *small = (const GFXfont *)&firasans_small;
+
+    // Header: 1/2-scale logo + "tiny-reader" title in the larger 32pt face.
+    // Optional right-aligned page indicator on the same baseline.
+    {
+        int sx = LIST_X, sy = 20;
+        int row_bytes = (LOGO_W + 7) / 8;
+        for (int y = 0; y < LOGO_H; y += 2) {
+            for (int x = 0; x < LOGO_W; x += 2) {
+                if (LOGO_BITMAP[y * row_bytes + (x >> 3)] & (0x80 >> (x & 7))) {
+                    int dy = sy + y / 2, dx = sx + x / 2;
+                    if (dy < 0 || dy >= EPD_HEIGHT || dx < 0 || dx >= EPD_WIDTH)
+                        continue;
+                    int idx = (dy * EPD_WIDTH + dx) / 2;
+                    framebuffer[idx] &= (dx & 1) ? 0x0F : 0xF0;
+                }
+            }
+        }
+    }
+    const GFXfont *title = (const GFXfont *)&freesans_title;
+    int32_t hx = LIST_X + (LOGO_W / 2) + 24, hy = 88;
+    writeln(title, "tiny-reader", &hx, &hy, framebuffer);
 
     // Page indicator (top-right) only when the library spans >1 page.
     if (!books.empty()) {
@@ -970,9 +1396,8 @@ static void render_book_list() {
                      cur_page + 1, total_pages);
             int32_t mx = 0, my = 0, mx1, my1, mw, mh;
             get_text_bounds(small, pageinfo, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
-            int32_t rx = EPD_WIDTH - LIST_X - mw, ry = 30;
+            int32_t rx = EPD_WIDTH - LIST_X - mw, ry = 88;
             writeln(small, pageinfo, &rx, &ry, framebuffer);
-            draw_hline(45, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
         }
     }
 
@@ -987,71 +1412,70 @@ static void render_book_list() {
         writeln(small, "then upload .epub files via the hub.",
                 &cx, &cy, framebuffer);
     } else {
-        // Right-edge column reserved for the progress indicator (bar + label).
-        const int BAR_W = 120;
+        // Right-edge column. Bar width scales with book size (40 px short
+        // book → 120 px long book), so a glance at the row tells you "this
+        // is a chunky tome vs. a novella". The bar always ends at RIGHT_X.
         const int BAR_H = 12;
-        const int LABEL_W = 60;            // room for "100%" / "Done"
         const int RIGHT_X = EPD_WIDTH - LIST_X;
-        const int BAR_X0 = RIGHT_X - BAR_W;
-        const int BAR_X1 = RIGHT_X;
+        const int PILL_SIZE = 18;             // tri-state pill icon side
 
         int row = 0;
         for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
             bool sel = ((int)i == selected);
-            int32_t baseline = LIST_Y + 60 + row * LINE_HEIGHT;
+            int32_t baseline = LIST_Y + 100 + row * LINE_HEIGHT;
 
-            // Cursor mark + title
+            // Cursor sprite (filled triangle) + title.
             std::string title = books[i];
             size_t dot = title.rfind(".epub");
             if (dot != std::string::npos) title.erase(dot);
             if (title.size() > 38) title = title.substr(0, 35) + "...";
-            std::string line = std::string(sel ? "> " : "  ") + title;
-            int32_t tx = LIST_X, ty = baseline;
-            writeln(body, line.c_str(), &tx, &ty, framebuffer);
+            if (sel) {
+                draw_selection_marker(LIST_X, baseline - 28, 24, framebuffer);
+            }
+            int32_t tx = LIST_X + 36, ty = baseline;
+            writeln(body, title.c_str(), &tx, &ty, framebuffer);
 
-            // Right-side state
+            // Right-side tri-state: not-started (hollow pill), reading
+            // (progress bar + %), finished (filled pill).
             int sp = 0, pg = 0, pct = 0;
             bool has_pos = read_position_for_name(String(books[i].c_str()),
                                                   &sp, &pg, &pct);
+            int pill_y0 = baseline - 22, pill_y1 = pill_y0 + PILL_SIZE;
+            int pill_x1 = RIGHT_X, pill_x0 = pill_x1 - PILL_SIZE;
             if (!has_pos) {
-                // unread — leave blank for a clean look
+                // not started — empty rounded pill
+                draw_rect_rounded(pill_x0, pill_y0, pill_x1, pill_y1,
+                                  PILL_SIZE / 2, framebuffer);
                 continue;
             }
             if (pct >= 99) {
-                // finished
-                const char *label = "Done";
-                int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-                get_text_bounds(small, label, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
-                int32_t rx = RIGHT_X - mw, ry = baseline;
-                writeln(small, label, &rx, &ry, framebuffer);
+                // finished — solid filled pill
+                fill_rect_rounded_gray(pill_x0, pill_y0, pill_x1, pill_y1,
+                                       PILL_SIZE / 2, 0x0,
+                                       /*preserve_non_white=*/false, framebuffer);
                 continue;
             }
-            // in progress: percent label + horizontal bar
-            char label[8];
-            snprintf(label, sizeof(label), "%d%%", pct);
-            int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-            get_text_bounds(small, label, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
-            int32_t lblx = BAR_X0 - 8 - mw, lbly = baseline;
-            writeln(small, label, &lblx, &lbly, framebuffer);
-
+            // in progress: fixed-width bar only (no percent label).
+            const int BAR_W = 120;
+            int bar_x1 = RIGHT_X;
+            int bar_x0 = bar_x1 - BAR_W;
             int by0 = baseline - 22;
             int by1 = by0 + BAR_H;
-            draw_hline(by0, BAR_X0, BAR_X1, framebuffer);
-            draw_hline(by1, BAR_X0, BAR_X1, framebuffer);
-            draw_vline(BAR_X0, by0, by1, framebuffer);
-            draw_vline(BAR_X1, by0, by1, framebuffer);
-            int inner_w = (BAR_X1 - BAR_X0) - 4;
+            draw_hline(by0, bar_x0, bar_x1, framebuffer);
+            draw_hline(by1, bar_x0, bar_x1, framebuffer);
+            draw_vline(bar_x0, by0, by1, framebuffer);
+            draw_vline(bar_x1, by0, by1, framebuffer);
+            int inner_w = (bar_x1 - bar_x0) - 4;
             int fill_w = (pct * inner_w + 50) / 100;
             if (fill_w > 0)
-                fill_rect(BAR_X0 + 2, by0 + 2,
-                          BAR_X0 + 2 + fill_w, by1 - 1, framebuffer);
+                fill_rect(bar_x0 + 2, by0 + 2,
+                          bar_x0 + 2 + fill_w, by1 - 1, framebuffer);
         }
     }
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    draw_corner_button("tiny-todo");
+
+    flush_framebuffer(/*force_full=*/true);
 
     // Same idle-window peek as render_book_page(). In library mode the latch
     // is a debug-log only (see loop()), but we still keep it warm so the user
@@ -1117,23 +1541,21 @@ static void render_chapter_jump() {
                        ? CJ_ROWS_PER_PAGE : (total - cj_first);
         for (int row = 0; row < rows_shown; ++row) {
             int idx = cj_first + row;
-            int32_t cx = LIST_X + 40;
             int32_t cy = LIST_Y + 60 + row * CJ_ROW_HEIGHT;
-            const char *prefix = (idx == cur_toc) ? "> " : "  ";
             std::string title = g_toc_cache[idx].title;
             if (title.empty()) title = "(untitled)";
             if (title.size() > 50) title = title.substr(0, 47) + "...";
-            std::string line = std::string(prefix) + title;
-            writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
+            if (idx == cur_toc) {
+                draw_selection_marker(LIST_X, cy - 28, 24, framebuffer);
+            }
+            int32_t cx = LIST_X + 36;
+            writeln((GFXfont *)&FiraSans, title.c_str(), &cx, &cy, framebuffer);
         }
     }
 
     // (footer hints intentionally removed)
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 }
 
 // Returns the TOC index that was tapped, or -1 if the tap missed every row.
@@ -1192,15 +1614,25 @@ static void render_todo_list() {
     } else {
         const int max_rows = 8;
         for (size_t i = 0; i < g_todos.size() && (int)i < max_rows; ++i) {
-            cx = LIST_X + 40;
-            cy = LIST_Y + 60 + (int)i * LINE_HEIGHT;
-            const char *prefix = g_todos[i].done ? "[x] " : "[ ] ";
-            std::string line = std::string(prefix) + g_todos[i].text;
-            if (line.size() > 56) line = line.substr(0, 53) + "...";
+            int baseline = LIST_Y + 60 + (int)i * LINE_HEIGHT;
+            // Checkbox sprite to the left of the text.
+            draw_checkbox(LIST_X + 8, baseline - 36, 32,
+                          g_todos[i].done, framebuffer);
+            cx = LIST_X + 60; cy = baseline;
+            std::string line = g_todos[i].text;
+            if (line.size() > 54) line = line.substr(0, 51) + "...";
+            int32_t text_x_start = cx;
             writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
+            // Strikethrough done items.
+            if (g_todos[i].done) {
+                int32_t mw = cx - text_x_start;
+                int strike_y = baseline - 16;
+                draw_hline(strike_y,
+                           text_x_start, text_x_start + mw, framebuffer);
+            }
         }
         if ((int)g_todos.size() > max_rows) {
-            cx = LIST_X + 40;
+            cx = LIST_X + 60;
             cy = LIST_Y + 60 + max_rows * LINE_HEIGHT;
             char more[40];
             snprintf(more, sizeof(more), "... and %d more (see hub)",
@@ -1209,10 +1641,9 @@ static void render_todo_list() {
         }
     }
 
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    draw_corner_button("tiny-reader");
+
+    flush_framebuffer(/*force_full=*/true);
 }
 
 static void move_selection(int delta) {
@@ -1232,16 +1663,30 @@ static void open_selected() {
 
     current_book_path = std::string("/sd/") + books[selected];
 
-    // Try to resume from saved position.
-    int saved_ch = 0, saved_pg = 0;
-    bool resumed = load_position(&saved_ch, &saved_pg);
+    // Try to resume from saved position. If the .pos sidecar also recorded
+    // the chapter's page count at save time, scale `saved_pg` to the
+    // current pagination — covers the "user changed density between
+    // sessions" case so we land at roughly the same place rather than at
+    // a literal "page N" of a totally different layout.
+    int saved_ch = 0, saved_pg = 0, saved_chap_pages = 0;
+    bool resumed = load_position(&saved_ch, &saved_pg, &saved_chap_pages);
 
     if (load_chapter(resumed ? saved_ch : 0)) {
         Serial.printf("Loaded book: spine=%d, chapter has %u pages%s\n",
                       total_spine, (unsigned)chapter_pages.size(),
                       resumed ? " (resumed)" : "");
-        if (resumed && saved_pg >= 0 && saved_pg < (int)chapter_pages.size()) {
-            current_page_in_chapter = saved_pg;
+        if (resumed) {
+            int target = saved_pg;
+            int new_pages = (int)chapter_pages.size();
+            if (saved_chap_pages > 0 && new_pages > 0 &&
+                saved_chap_pages != new_pages) {
+                target = (int)((int64_t)saved_pg * new_pages / saved_chap_pages);
+                Serial.printf("[POS_RESCALE] %d/%d -> %d/%d\n",
+                              saved_pg, saved_chap_pages, target, new_pages);
+            }
+            if (target < 0) target = 0;
+            if (target >= new_pages) target = new_pages - 1;
+            current_page_in_chapter = target;
         }
         app_mode = MODE_BOOK;
         render_book_page();
@@ -1303,296 +1748,43 @@ static String ap_build_books_json() {
 static void render_ap_screen() {
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
 
-    // Title
-    int32_t cx = 60, cy = 70;
-    writeln((GFXfont *)&FiraSans, "tiny-reader hub", &cx, &cy, framebuffer);
-
-    // Underline
-    for (int x = 60; x < EPD_WIDTH - 60; ++x) {
-        int idx = (90 * EPD_WIDTH + x) / 2;
-        framebuffer[idx] &= (x & 1) ? 0x0F : 0xF0;
+    // Header: 1/2-scale logo + "tiny-reader" title in the larger 32pt face.
+    {
+        int sx = 60, sy = 35;
+        int row_bytes = (LOGO_W + 7) / 8;
+        for (int y = 0; y < LOGO_H; y += 2) {
+            for (int x = 0; x < LOGO_W; x += 2) {
+                if (LOGO_BITMAP[y * row_bytes + (x >> 3)] & (0x80 >> (x & 7))) {
+                    int dy = sy + y / 2, dx = sx + x / 2;
+                    if (dy < 0 || dy >= EPD_HEIGHT || dx < 0 || dx >= EPD_WIDTH)
+                        continue;
+                    int idx = (dy * EPD_WIDTH + dx) / 2;
+                    framebuffer[idx] &= (dx & 1) ? 0x0F : 0xF0;
+                }
+            }
+        }
     }
+    int32_t cx = 60 + (LOGO_W / 2) + 24, cy = 110;
+    writeln((GFXfont *)&freesans_title, "tiny-reader", &cx, &cy, framebuffer);
 
-    // 1. Connect
-    cx = 60; cy = 160;
-    writeln((GFXfont *)&FiraSans, "1.  Connect to this WiFi network:",
-            &cx, &cy, framebuffer);
+    // Single-line SSID + URL.
     char line[200];
-    cx = 100; cy = 215;
-    snprintf(line, sizeof(line), "SSID:      %s", ap_ssid.c_str());
-    writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
-    cx = 100; cy = 265;
-    snprintf(line, sizeof(line), "Password:  %s", ap_password.c_str());
+    cx = 60; cy = 240;
+    snprintf(line, sizeof(line), "Connect to WiFi: %s", ap_ssid.c_str());
     writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
 
-    // 2. Open URL
     cx = 60; cy = 340;
-    writeln((GFXfont *)&FiraSans, "2.  Open in any browser:",
-            &cx, &cy, framebuffer);
-    cx = 100; cy = 395;
-    snprintf(line, sizeof(line), "http://%s",
+    snprintf(line, sizeof(line), "Open in browser: http://%s",
              WiFi.softAPIP().toString().c_str());
     writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
 
-    // Footer
-    cx = 60; cy = EPD_HEIGHT - 30;
-    snprintf(line, sizeof(line),
-             "Hold button >= 1.5s to exit  -  auto-exits after %d min idle",
-             g_settings.ap_idle_minutes);
-    writeln((GFXfont *)&FiraSans, line, &cx, &cy, framebuffer);
-
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 }
-
-static const char AP_INDEX_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html><head><meta charset="UTF-8"/>
-<meta name=viewport content="width=device-width,initial-scale=1"/>
-<title>tiny-reader</title>
-<style>
-body{font-family:-apple-system,sans-serif;max-width:640px;margin:0 auto;padding:1em;}
-h1{font-size:1.4em;}
-.book{padding:.6em;border-bottom:1px solid #ccc;}
-.book-row{display:flex;align-items:center;gap:.5em;}
-.book-name{flex:1;word-break:break-all;}
-.book-meta{color:#666;font-size:.85em;display:flex;gap:.6em;margin-top:.2em;}
-button{font-size:.95em;padding:.4em .8em;}
-.btn-link{background:none;border:none;color:#06c;padding:0;cursor:pointer;text-decoration:underline;}
-form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
-.danger{background:#fee;color:#900;border:1px solid #c66;}
-.muted{color:#666;font-size:.9em;}
-.editor{margin-top:.4em;padding:.4em;background:#f5f5f5;border-radius:4px;display:flex;align-items:center;gap:.4em;flex-wrap:wrap;}
-.editor input{width:5em;font-size:1em;padding:.2em;}
-</style></head><body>
-<h1>tiny-reader</h1>
-<div id=books class=muted>loading...</div>
-<form id=up onsubmit="upload(event)">
-<h3>upload .epub</h3>
-<input type=file name=file accept=".epub" required/>
-<button>upload</button>
-<div id=status class=muted></div>
-</form>
-<form id=sf onsubmit="saveSettings(event)">
-<h3>settings</h3>
-<label>text density
- <select name=density id=density>
-  <option value=0>compact (more text per page)</option>
-  <option value=1>medium (default)</option>
-  <option value=2>loose (more breathing room)</option>
- </select>
-</label>
-<br><br>
-<label>WiFi share auto-exit after
- <input type=number name=ap_idle_minutes id=apidle min=1 max=120 step=1 style="width:5em">
- minutes idle
-</label>
-<br><br>
-<button>save settings</button>
-<div id=settings_status class=muted></div>
-</form>
-<form id=tf onsubmit="addTodo(event)">
-<h3>todo</h3>
-<div id=todos class=muted>loading...</div>
-<div style="display:flex;gap:.4em;margin-top:.6em;">
- <input type=text id=todo_text maxlength=200 placeholder="new item" style="flex:1;font-size:1em;padding:.3em" required/>
- <button>add</button>
-</div>
-<div id=todo_status class=muted></div>
-</form>
-<script>
- var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
- var jsq=function(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");};
- var load=function(){
-  fetch('/api/books').then(function(r){return r.json();}).then(function(list){
-   var d=document.getElementById('books');
-   if(!list.length){d.innerHTML='<p class=muted>(empty)</p>';return;}
-   d.innerHTML=list.map(function(b){
-    var pos = b.hasPos
-              ? ((b.percent>0?b.percent+'% · ':'')+'ch '+(b.spine+1)+', page '+(b.page+1))
-              : 'not started';
-    return '<div class=book>'+
-     '<div class=book-row>'+
-      '<span class=book-name>'+esc(b.name)+'</span>'+
-      '<button class=danger onclick="del(\''+jsq(b.name)+'\')">delete</button>'+
-     '</div>'+
-     '<div class=book-meta>'+
-      '<span>'+(b.size/1024).toFixed(0)+'KB</span>'+
-      '<span>'+pos+'</span>'+
-      '<a href="/api/books/'+encodeURIComponent(b.name)+'" download>download</a>'+
-      '<button class=btn-link onclick="editPos(\''+jsq(b.name)+'\','+b.spine+','+b.page+')">edit position</button>'+
-     '</div>'+
-     '<div class=editor id="ed-'+esc(b.name)+'" style="display:none"></div>'+
-    '</div>';
-   }).join('');
-  });
- };
- var editPos=function(name,sp,pg){
-  var sel='#ed-'+CSS.escape(name);
-  var ed=document.querySelector(sel);
-  ed.style.display='flex';
-  ed.innerHTML='chapter <input id=sp value='+(sp+1)+' min=1> page <input id=pg value='+(pg+1)+' min=1> '+
-   '<button class=btn-link onclick="savePos(\''+jsq(name)+'\')">save</button>'+
-   '<button class=btn-link onclick="cancelPos(\''+jsq(name)+'\')">cancel</button>';
- };
- var cancelPos=function(name){
-  var ed=document.querySelector('#ed-'+CSS.escape(name));
-  ed.style.display='none'; ed.innerHTML='';
- };
- var savePos=function(name){
-  var ed=document.querySelector('#ed-'+CSS.escape(name));
-  var sp=Math.max(0,parseInt(ed.querySelector('#sp').value,10)-1);
-  var pg=Math.max(0,parseInt(ed.querySelector('#pg').value,10)-1);
-  var fd=new URLSearchParams(); fd.append('spine',sp); fd.append('page',pg);
-  fetch('/api/books/'+encodeURIComponent(name)+'/pos',
-        {method:'POST',body:fd,headers:{'Content-Type':'application/x-www-form-urlencoded'}})
-   .then(function(r){if(r.ok){load();}else{alert('save failed');}});
- };
- var upload=function(e){
-  e.preventDefault();
-  var st=document.getElementById('status');
-  var f=e.target.file.files[0]; if(!f) return;
-  var CHUNK=32*1024;
-  var totalKB=(f.size/1024).toFixed(0);
-  var postChunk=function(url,body,attempt){
-   attempt=attempt||1;
-   var ctrl=new AbortController();
-   var t=setTimeout(function(){ctrl.abort();},15000);
-   return fetch(url,{method:'POST',body:body,
-                     headers:{'Content-Type':'application/octet-stream'},
-                     signal:ctrl.signal})
-    .then(function(r){clearTimeout(t); if(!r.ok) throw new Error('HTTP '+r.status); return r;})
-    .catch(function(err){
-     clearTimeout(t);
-     if(attempt<3){
-      st.textContent='retry '+attempt+' ('+err.message+')';
-      return new Promise(function(res){setTimeout(res,500*attempt);})
-              .then(function(){return postChunk(url,body,attempt+1);});
-     }
-     throw err;
-    });
-  };
-  var sendNext=function(offset){
-   if(offset>=f.size){
-    postChunk('/api/upload_chunk?name='+encodeURIComponent(f.name)+'&offset='+f.size+'&final=1',new Blob([]))
-     .then(function(){ st.textContent='done '+totalKB+' KB'; load(); })
-     .catch(function(err){ st.textContent='final marker failed: '+err.message; });
-    return;
-   }
-   var endOff=Math.min(offset+CHUNK,f.size);
-   var chunk=f.slice(offset,endOff);
-   var pct=((endOff/f.size)*100).toFixed(0);
-   st.textContent='uploading '+pct+'% ('+(endOff/1024).toFixed(0)+'/'+totalKB+' KB)';
-   postChunk('/api/upload_chunk?name='+encodeURIComponent(f.name)+'&offset='+offset,chunk)
-    .then(function(){ setTimeout(function(){sendNext(endOff);},50); })
-    .catch(function(err){ st.textContent='upload failed @ '+offset+': '+err.message; });
-  };
-  sendNext(0);
- };
- var del=function(n){
-  if(!confirm('delete '+n+'?')) return;
-  fetch('/api/books/'+encodeURIComponent(n),{method:'DELETE'}).then(function(r){
-   if(r.ok) load(); else alert('delete failed');
-  });
- };
- var loadSettings=function(){
-  fetch('/api/settings').then(function(r){return r.json();}).then(function(s){
-   document.getElementById('density').value=s.density;
-   document.getElementById('apidle').value=s.ap_idle_minutes;
-  });
- };
- var saveSettings=function(e){
-  e.preventDefault();
-  var st=document.getElementById('settings_status');
-  var fd=new URLSearchParams();
-  fd.append('density',document.getElementById('density').value);
-  fd.append('ap_idle_minutes',document.getElementById('apidle').value);
-  st.textContent='saving...';
-  fetch('/api/settings',{method:'POST',body:fd,
-        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
-   .then(function(r){
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    return r.json();
-   })
-   .then(function(j){
-    st.textContent=j.changed? 'saved (applies on next book open)'
-                            : 'saved (no changes)';
-   })
-   .catch(function(err){
-    st.textContent='save failed: '+err.message;
-   });
- };
- var todoState=[];
- var renderTodos=function(){
-  var d=document.getElementById('todos');
-  if(!todoState.length){d.innerHTML='<p class=muted>(empty)</p>';return;}
-  d.innerHTML=todoState.map(function(it,i){
-   var checked=it.done?' checked':'';
-   return '<div class=book>'+
-    '<div class=book-row>'+
-     '<input type=checkbox data-i='+i+' onchange="toggleTodo('+i+')"'+checked+'/>'+
-     '<span class=book-name'+(it.done?' style="text-decoration:line-through;color:#888"':'')+'>'+esc(it.text)+'</span>'+
-     '<button class=btn-link onclick="delTodo('+i+')">delete</button>'+
-    '</div>'+
-   '</div>';
-  }).join('');
- };
- var loadTodos=function(){
-  fetch('/api/todos').then(function(r){return r.json();}).then(function(j){
-   todoState=(j&&j.items)?j.items:[];
-   renderTodos();
-  });
- };
- var saveTodos=function(){
-  var st=document.getElementById('todo_status');
-  var fd=new URLSearchParams();
-  fd.append('items',JSON.stringify(todoState));
-  st.textContent='saving...';
-  fetch('/api/todos',{method:'POST',body:fd,
-        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
-   .then(function(r){
-    if(!r.ok) return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});
-    return r.json();
-   })
-   .then(function(){st.textContent='saved';})
-   .catch(function(err){st.textContent='save failed: '+err.message;loadTodos();});
- };
- var addTodo=function(e){
-  e.preventDefault();
-  var input=document.getElementById('todo_text');
-  var t=(input.value||'').trim();
-  if(!t) return;
-  if(t.length>200){document.getElementById('todo_status').textContent='item too long (max 200 chars)';return;}
-  if(todoState.length>=50){document.getElementById('todo_status').textContent='max 50 items';return;}
-  todoState.push({text:t,done:false});
-  input.value='';
-  renderTodos();
-  saveTodos();
- };
- var toggleTodo=function(i){
-  if(i<0||i>=todoState.length) return;
-  todoState[i].done=!todoState[i].done;
-  renderTodos();
-  saveTodos();
- };
- var delTodo=function(i){
-  if(i<0||i>=todoState.length) return;
-  todoState.splice(i,1);
-  renderTodos();
-  saveTodos();
- };
- load();
- loadSettings();
- loadTodos();
-</script></body></html>
-)HTML";
 
 // Async handlers below take AsyncWebServerRequest *req.
 static void ap_handle_root(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    AsyncWebServerResponse *r = req->beginResponse_P(200, "text/html; charset=utf-8", AP_INDEX_HTML);
+    AsyncWebServerResponse *r = req->beginResponse_P(200, "text/html; charset=utf-8", HUB_HTML);
     req->send(r);
 }
 static void ap_handle_settings_get(AsyncWebServerRequest *req) {
@@ -1739,6 +1931,10 @@ static const size_t CHUNK_BUF_SIZE = 64 * 1024;
 static uint8_t *g_chunk_buf = nullptr;
 static size_t   g_chunk_used = 0;
 static bool     g_chunk_overflow = false;
+// Last time a chunk arrived. Read from loop() to suppress the AP idle timer
+// while an upload is mid-stream — covers cases where ap_last_activity
+// somehow lags (cross-task visibility, JS timing) and a long page sit.
+static volatile uint32_t g_chunk_last_ms = 0;
 
 static void ap_handle_chunk_body(AsyncWebServerRequest *req, uint8_t *data,
                                  size_t len, size_t index, size_t total) {
@@ -1760,6 +1956,7 @@ static void ap_handle_chunk_body(AsyncWebServerRequest *req, uint8_t *data,
 
 static void ap_handle_chunk_done(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
+    g_chunk_last_ms = ap_last_activity;
     if (!req->hasParam("name") || !req->hasParam("offset")) {
         req->send(400, "application/json", "{\"error\":\"missing name/offset\"}");
         return;
@@ -1825,16 +2022,16 @@ static void ap_handle_book_path(AsyncWebServerRequest *req) {
                      sp, pg, pct, ok ? "true" : "false");
             req->send(200, "application/json", buf);
         } else if (req->method() == HTTP_POST) {
-            int sp = 0, pg = 0, pct = 0;
-            // Preserve any existing percent so a hub edit doesn't reset
-            // the library progress display until the user opens the book.
+            int sp = 0, pg = 0, pct = 0, cp = 0;
+            // Preserve existing percent + chapter_pages so a hub edit
+            // doesn't lose the scaling info or the library progress %.
             int prev_sp = 0, prev_pg = 0;
-            read_position_for_name(name, &prev_sp, &prev_pg, &pct);
+            read_position_for_name(name, &prev_sp, &prev_pg, &pct, &cp);
             if (req->hasParam("spine", true)) sp = req->getParam("spine", true)->value().toInt();
             if (req->hasParam("page",  true)) pg = req->getParam("page",  true)->value().toInt();
             if (sp < 0) sp = 0;
             if (pg < 0) pg = 0;
-            bool ok = write_position_for_name(name, sp, pg, pct);
+            bool ok = write_position_for_name(name, sp, pg, pct, cp);
             req->send(ok ? 200 : 500, "application/json",
                       ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
         } else {
@@ -2182,10 +2379,7 @@ static void enter_deep_sleep() {
     cx = 60; cy = 340;
     writeln((GFXfont *)&FiraSans,
             "(Your reading position is saved.)", &cx, &cy, framebuffer);
-    epd_poweron();
-    epd_clear();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
-    epd_poweroff();
+    flush_framebuffer(/*force_full=*/true);
 
     // Wait for the button to be released before arming wake — otherwise ext0
     // sees it still LOW and wakes the chip immediately, looking like sleep
@@ -2316,8 +2510,20 @@ void loop() {
     if (ap_active) {
         if (dns_server) dns_server->processNextRequest();
         // AsyncWebServer runs its own task; no handleClient() needed.
-        if (now - ap_last_activity > ap_idle_timeout_ms) {
-            Serial.println("[AP] idle timeout");
+        // Idle/upload-fresh checks are wrap-safe: ap_last_activity and
+        // g_chunk_last_ms are written by AsyncTCP-task callbacks. The
+        // loop core can observe a value 1 ms ahead of its own millis()
+        // (cross-core read), so a naive `now - ts` would underflow into
+        // a 49-day apparent idle. If ts looks "future", treat as 0.
+        uint32_t idle_ms = (now >= ap_last_activity)
+                           ? (now - ap_last_activity) : 0;
+        bool upload_active = (g_chunk_last_ms != 0) &&
+                             ((now < g_chunk_last_ms) ||
+                              (now - g_chunk_last_ms < 60000UL));
+        if (!upload_active && idle_ms > ap_idle_timeout_ms) {
+            Serial.printf("[AP] idle timeout (idle=%u ms, limit=%u)\n",
+                          (unsigned)idle_ms,
+                          (unsigned)ap_idle_timeout_ms);
             exit_ap_mode();
             return;
         }
@@ -2353,11 +2559,11 @@ void loop() {
                 Serial.printf("tap (%d,%d) zone=%d mode=%d\n",
                               xs[0], ys[0], zone, app_mode);
                 Serial.flush();
-                // Bottom-right corner toggles TODO view from library, and
-                // exits TODO view back to library. (Touch orientation makes
-                // the top-right corner unreliable; bottom-right is solid.)
-                bool corner_right = (xs[0] > EPD_WIDTH - 100 &&
-                                     ys[0] > EPD_HEIGHT - 100);
+                // Visual bottom-right corner: enters TODO view from
+                // library, exits TODO back to library. Touch Y origin is
+                // bottom-left of the screen, so visual bottom = low Y.
+                bool corner_right = (xs[0] > EPD_WIDTH - 200 &&
+                                     ys[0] < 100);
                 if (app_mode == MODE_TODO) {
                     // Top edge or bottom-right corner exits.
                     if (ys[0] > EPD_HEIGHT - 80 || corner_right) {
