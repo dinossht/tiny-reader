@@ -404,12 +404,28 @@ static std::vector<std::string> wrap_text(const std::string &text) {
 }
 
 // Group lines into pages.
-static std::vector<std::string> paginate_lines(const std::vector<std::string> &lines) {
+static std::vector<std::string> paginate_lines(
+        const std::vector<std::string> &lines,
+        const std::vector<std::string> *break_titles = nullptr) {
     std::vector<std::string> pages;
     std::string page;
     int n_in_page = 0;
     for (const auto &line : lines) {
-        if (n_in_page >= book_lines_per_page) {
+        // Force a page break before any line that begins a known TOC title
+        // — used for single-spine Gutenberg books so chapter titles always
+        // land at the top of a fresh page. (line is the wrap-output, may
+        // be only the first wrapped piece of the title, hence prefix-match.)
+        bool chapter_break = false;
+        if (break_titles && n_in_page > 0 && line.size() >= 8) {
+            for (const auto &t : *break_titles) {
+                if (t.size() >= line.size() &&
+                    t.compare(0, line.size(), line) == 0) {
+                    chapter_break = true;
+                    break;
+                }
+            }
+        }
+        if (n_in_page >= book_lines_per_page || chapter_break) {
             pages.push_back(page);
             page.clear();
             n_in_page = 0;
@@ -458,7 +474,16 @@ static void chapter_load_task(void *param) {
                 std::string text = strip_xhtml((const char *)data, size);
                 free(data);
                 auto lines = wrap_text(text);
-                r->pages = paginate_lines(lines);
+                // Collect titles from the TOC that point at this spine —
+                // when many TOC entries share one spine (Gutenberg) we use
+                // them as page-break hints so each chapter starts at top.
+                std::vector<std::string> break_titles;
+                for (const auto &e : r->toc) {
+                    if (e.spine_index == r->spine_to_load)
+                        break_titles.push_back(e.title);
+                }
+                r->pages = paginate_lines(lines, break_titles.empty() ? nullptr
+                                                                      : &break_titles);
                 Serial.printf("chapter %d: %u pages, %u lines, %u bytes (toc=%u)\n",
                               r->spine_to_load, (unsigned)r->pages.size(),
                               (unsigned)lines.size(), (unsigned)text.size(),
@@ -498,34 +523,57 @@ static String pos_path_for_name(const String &name) {
     return String("/") + name.substring(0, dot) + ".pos";
 }
 
-static bool read_position_for_name(const String &name, int *out_spine, int *out_page) {
+// .pos format: "<spine> <page> [<percent>]\n". Percent is appended so the
+// library row can show progress that matches the book footer; legacy two-int
+// files (written before this) are read back with percent=0.
+static bool read_position_for_name(const String &name, int *out_spine,
+                                   int *out_page, int *out_percent = nullptr) {
     File f = SD.open(pos_path_for_name(name), FILE_READ);
     if (!f) return false;
     String line = f.readStringUntil('\n');
     f.close();
-    int sp = -1, pg = -1;
-    if (sscanf(line.c_str(), "%d %d", &sp, &pg) == 2) {
+    int sp = -1, pg = -1, pct = 0;
+    int n = sscanf(line.c_str(), "%d %d %d", &sp, &pg, &pct);
+    if (n >= 2) {
         *out_spine = sp;
         *out_page = pg;
+        if (out_percent) *out_percent = (n >= 3) ? pct : 0;
         return true;
     }
     return false;
 }
 
-static bool write_position_for_name(const String &name, int spine, int page) {
+static bool write_position_for_name(const String &name, int spine, int page,
+                                    int percent = 0) {
     String path = pos_path_for_name(name);
     File f = SD.open(path, FILE_WRITE);
     if (!f) { Serial.printf("write_position: open %s failed\n", path.c_str()); return false; }
-    f.printf("%d %d\n", spine, page);
+    f.printf("%d %d %d\n", spine, page, percent);
     f.close();
-    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d\n", path.c_str(), spine, page);
+    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d %d%%\n",
+                  path.c_str(), spine, page, percent);
     return true;
+}
+
+// Compute book-level progress % the same way render_book_page() does, so the
+// number we persist matches what the user just saw on screen.
+static int compute_book_progress_pct() {
+    if (total_spine <= 0 || chapter_pages.empty()) return 0;
+    int chap_pages = (int)chapter_pages.size();
+    int read_pages = chap_pages * current_spine + (current_page_in_chapter + 1);
+    int total_pages_est = chap_pages * total_spine;
+    if (total_pages_est <= 0) return 0;
+    int pct = (read_pages * 100 + total_pages_est / 2) / total_pages_est;
+    if (pct > 100) pct = 100;
+    if (pct < 0)   pct = 0;
+    return pct;
 }
 
 static void save_position() {
     if (selected < 0 || selected >= (int)books.size()) return;
     write_position_for_name(String(books[selected].c_str()),
-                            current_spine, current_page_in_chapter);
+                            current_spine, current_page_in_chapter,
+                            compute_book_progress_pct());
 }
 
 static bool load_position(int *out_spine, int *out_page) {
@@ -912,11 +960,14 @@ static void render_book_list() {
             std::string line = std::string(prefix) + " " + title;
             writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
 
-            // Saved position, right-aligned
-            int sp = 0, pg = 0;
-            if (read_position_for_name(String(books[i].c_str()), &sp, &pg)) {
+            // Saved position, right-aligned. Show progress % + page within
+            // chapter so it matches what the book footer shows. (We avoid
+            // a "ch N" label here because spine index ≠ TOC chapter number.)
+            int sp = 0, pg = 0, pct = 0;
+            if (read_position_for_name(String(books[i].c_str()), &sp, &pg, &pct)) {
                 char info[40];
-                snprintf(info, sizeof(info), "ch %d  p %d", sp + 1, pg + 1);
+                if (pct > 0) snprintf(info, sizeof(info), "%d%%  p %d", pct, pg + 1);
+                else         snprintf(info, sizeof(info), "p %d", pg + 1);
                 int32_t mx = 0, my = 0, mx1, my1, mw, mh;
                 get_text_bounds((GFXfont *)&FiraSans, info,
                                 &mx, &my, &mx1, &my1, &mw, &mh, NULL);
@@ -1017,7 +1068,9 @@ static void render_chapter_jump() {
     epd_poweroff();
 }
 
-// Returns the spine_index to jump to, or -1 if the tap missed every row.
+// Returns the TOC index that was tapped, or -1 if the tap missed every row.
+// (Caller looks up spine_index + title from g_toc_cache so we can do the
+// title-text search needed for single-spine Gutenberg books.)
 static int chapter_jump_hit_test(int16_t x, int16_t y) {
     if (g_toc_cache.empty()) return -1;
     int screen_y = EPD_HEIGHT - 1 - y;
@@ -1027,10 +1080,10 @@ static int chapter_jump_hit_test(int16_t x, int16_t y) {
     int row = (screen_y - rows_top) / CJ_ROW_HEIGHT;
     int idx = cj_first + row;
     if (idx < 0 || idx >= (int)g_toc_cache.size()) return -1;
-    int sp = g_toc_cache[idx].spine_index;
     Serial.printf("[CJ] tap (%d,%d) -> row=%d toc[%d]='%s' spine=%d\n",
-                  x, y, row, idx, g_toc_cache[idx].title.c_str(), sp);
-    return sp;
+                  x, y, row, idx, g_toc_cache[idx].title.c_str(),
+                  g_toc_cache[idx].spine_index);
+    return idx;
 }
 
 // Convert a tap on the TODO list view into the item index, or -1 if outside
@@ -1161,12 +1214,13 @@ static String ap_build_books_json() {
                 String esc = name;
                 esc.replace("\\", "\\\\");
                 esc.replace("\"", "\\\"");
-                int sp = 0, pg = 0;
-                bool has_pos = read_position_for_name(name, &sp, &pg);
+                int sp = 0, pg = 0, pct = 0;
+                bool has_pos = read_position_for_name(name, &sp, &pg, &pct);
                 json += "{\"name\":\"" + esc + "\"";
                 json += ",\"size\":" + String(f.size());
                 json += ",\"spine\":" + String(sp);
                 json += ",\"page\":" + String(pg);
+                json += ",\"percent\":" + String(pct);
                 json += ",\"hasPos\":" + String(has_pos ? "true" : "false");
                 json += "}";
             }
@@ -1288,7 +1342,9 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
    var d=document.getElementById('books');
    if(!list.length){d.innerHTML='<p class=muted>(empty)</p>';return;}
    d.innerHTML=list.map(function(b){
-    var pos = b.hasPos? ('ch '+(b.spine+1)+', page '+(b.page+1)) : 'not started';
+    var pos = b.hasPos
+              ? ((b.percent>0?b.percent+'% · ':'')+'ch '+(b.spine+1)+', page '+(b.page+1))
+              : 'not started';
     return '<div class=book>'+
      '<div class=book-row>'+
       '<span class=book-name>'+esc(b.name)+'</span>'+
@@ -1693,19 +1749,24 @@ static void ap_handle_book_path(AsyncWebServerRequest *req) {
 
     if (action == "pos") {
         if (req->method() == HTTP_GET) {
-            int sp = 0, pg = 0;
-            bool ok = read_position_for_name(name, &sp, &pg);
-            char buf[80];
-            snprintf(buf, sizeof(buf), "{\"spine\":%d,\"page\":%d,\"saved\":%s}",
-                     sp, pg, ok ? "true" : "false");
+            int sp = 0, pg = 0, pct = 0;
+            bool ok = read_position_for_name(name, &sp, &pg, &pct);
+            char buf[100];
+            snprintf(buf, sizeof(buf),
+                     "{\"spine\":%d,\"page\":%d,\"percent\":%d,\"saved\":%s}",
+                     sp, pg, pct, ok ? "true" : "false");
             req->send(200, "application/json", buf);
         } else if (req->method() == HTTP_POST) {
-            int sp = 0, pg = 0;
+            int sp = 0, pg = 0, pct = 0;
+            // Preserve any existing percent so a hub edit doesn't reset
+            // the library progress display until the user opens the book.
+            int prev_sp = 0, prev_pg = 0;
+            read_position_for_name(name, &prev_sp, &prev_pg, &pct);
             if (req->hasParam("spine", true)) sp = req->getParam("spine", true)->value().toInt();
             if (req->hasParam("page",  true)) pg = req->getParam("page",  true)->value().toInt();
             if (sp < 0) sp = 0;
             if (pg < 0) pg = 0;
-            bool ok = write_position_for_name(name, sp, pg);
+            bool ok = write_position_for_name(name, sp, pg, pct);
             req->send(ok ? 200 : 500, "application/json",
                       ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
         } else {
@@ -2218,10 +2279,28 @@ void loop() {
                             render_book_page();
                         }
                     } else {
-                        int hit = chapter_jump_hit_test(xs[0], ys[0]);
-                        if (hit >= 0 && hit < total_spine) {
-                            Serial.printf("[CJ] jump to chapter %d\n", hit);
-                            if (load_chapter(hit)) {
+                        int toc_idx = chapter_jump_hit_test(xs[0], ys[0]);
+                        if (toc_idx >= 0 && toc_idx < (int)g_toc_cache.size()) {
+                            int sp = g_toc_cache[toc_idx].spine_index;
+                            const std::string &title = g_toc_cache[toc_idx].title;
+                            Serial.printf("[CJ] jump to toc[%d] sp=%d\n",
+                                          toc_idx, sp);
+                            if (sp >= 0 && sp < total_spine && load_chapter(sp)) {
+                                // Single-spine Gutenberg books: many TOC entries
+                                // share the same spine item; the actual chapter
+                                // is an anchor inside it. Find the page where
+                                // the chapter title text appears.
+                                if (!title.empty() && chapter_pages.size() > 1) {
+                                    for (size_t p = 0; p < chapter_pages.size(); ++p) {
+                                        if (chapter_pages[p].find(title)
+                                            != std::string::npos) {
+                                            current_page_in_chapter = (int)p;
+                                            Serial.printf("[CJ] title found on p=%u\n",
+                                                          (unsigned)p);
+                                            break;
+                                        }
+                                    }
+                                }
                                 app_mode = MODE_BOOK;
                                 render_book_page();
                                 save_position();

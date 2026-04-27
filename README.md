@@ -6,7 +6,9 @@ files on an SD card or upload them wirelessly from your phone/laptop.
 
 ## Features
 
-- Reads `.epub` files from the SD card root
+- Reads `.epub` files from the SD card root — both EPUB 2 (NCX TOC) and
+  EPUB 3 (HTML5 nav doc), including Project Gutenberg single-spine books
+  where TOC entries are anchors inside one big xhtml file
 - XHTML parsing → word-wrapping → justified body text (last line of paragraph stays
   ragged, like a printed book)
 - GT911 touch nav: tap left half = previous page, tap right half = next page,
