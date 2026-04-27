@@ -30,11 +30,14 @@
 #include <TouchDrvGT911.hpp>
 #include "Epub.h"
 
-// Phase E: WiFi AP + on-board web server
+// Phase E: WiFi AP + on-board web server (async — sync WebServer.h dies after
+// a couple of back-to-back requests; AsyncWebServer handles concurrency).
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
 #include <DNSServer.h>
+#include <ESPAsyncWebServer.h>
+#include <esp_netif.h>
+#include <lwip/ip4_addr.h>
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
@@ -60,12 +63,43 @@ static int total_spine = 0;
 static int current_page_in_chapter = 0;
 static std::vector<std::string> chapter_pages;  // each entry = one page of \n-separated lines
 static const int BOOK_MARGIN_X = 50;
-static const int BOOK_LINE_HEIGHT = 50;     // FiraSans advance_y per firasans.h
 static const int BOOK_TOP_RESERVE = 30;     // small visual margin only
 static const int BOOK_FOOTER_RESERVE = 50;
-static const int BOOK_LINES_PER_PAGE =
-    (EPD_HEIGHT - BOOK_TOP_RESERVE - BOOK_FOOTER_RESERVE) / BOOK_LINE_HEIGHT;  // ~9
-static const int BOOK_CHARS_PER_LINE = 44;  // FiraSans is variable-width; conservative limit
+// Layout values that depend on the user's "density" setting (see g_settings).
+// FiraSans advance_y is 50 — line_height < 50 would overlap glyphs.
+static int book_line_height = 50;
+static int book_lines_per_page = 9;
+static int book_chars_per_line = 44;
+
+// User-editable settings persisted to /settings.json on SD.
+static struct Settings {
+    int density;           // 0=compact, 1=medium (default), 2=loose
+    int ap_idle_minutes;   // default 5
+} g_settings = { 1, 5 };
+
+static void apply_density() {
+    switch (g_settings.density) {
+        case 0:  // compact — same line height (font is bitmap), more chars/line
+            book_line_height = 50;
+            book_chars_per_line = 52;
+            break;
+        case 2:  // loose — extra leading between lines, fewer chars per line
+            book_line_height = 60;
+            book_chars_per_line = 36;
+            break;
+        case 1:  // medium (default)
+        default:
+            g_settings.density = 1;
+            book_line_height = 50;
+            book_chars_per_line = 44;
+            break;
+    }
+    book_lines_per_page =
+        (EPD_HEIGHT - BOOK_TOP_RESERVE - BOOK_FOOTER_RESERVE) / book_line_height;
+    Serial.printf("[SETTINGS] density=%d -> line_h=%d lines/page=%d chars/line=%d\n",
+                  g_settings.density, book_line_height,
+                  book_lines_per_page, book_chars_per_line);
+}
 
 // ---- helpers ----
 
@@ -82,6 +116,42 @@ static int read_battery_percent() {
     if (v >= 4.20f) return 100;
     if (v <= 3.30f) return 0;
     return (int)((v - 3.30f) / 0.90f * 100.0f + 0.5f);
+}
+
+// Load g_settings from /settings.json on SD; falls back to defaults if missing.
+static void load_settings() {
+    File f = SD.open("/settings.json", FILE_READ);
+    if (!f) {
+        Serial.println("[SETTINGS] no /settings.json — using defaults");
+        return;
+    }
+    String s = f.readString();
+    f.close();
+    int d_i = s.indexOf("\"density\"");
+    int t_i = s.indexOf("\"ap_idle_minutes\"");
+    if (d_i >= 0) {
+        int colon = s.indexOf(':', d_i);
+        if (colon >= 0) g_settings.density = s.substring(colon + 1).toInt();
+    }
+    if (t_i >= 0) {
+        int colon = s.indexOf(':', t_i);
+        if (colon >= 0) g_settings.ap_idle_minutes = s.substring(colon + 1).toInt();
+    }
+    if (g_settings.density < 0 || g_settings.density > 2) g_settings.density = 1;
+    if (g_settings.ap_idle_minutes < 1) g_settings.ap_idle_minutes = 5;
+    Serial.printf("[SETTINGS] loaded: density=%d ap_idle_minutes=%d\n",
+                  g_settings.density, g_settings.ap_idle_minutes);
+}
+
+static bool save_settings() {
+    File f = SD.open("/settings.json", FILE_WRITE);
+    if (!f) { Serial.println("[SETTINGS] save failed"); return false; }
+    f.printf("{\"density\":%d,\"ap_idle_minutes\":%d}\n",
+             g_settings.density, g_settings.ap_idle_minutes);
+    f.close();
+    Serial.printf("[SETTINGS] saved: density=%d ap_idle_minutes=%d\n",
+                  g_settings.density, g_settings.ap_idle_minutes);
+    return true;
 }
 
 static void clear_and_flush() {
@@ -201,7 +271,7 @@ static std::string strip_xhtml(const char *src, size_t len) {
     return decode_entities(out2);
 }
 
-// Greedy word-wrap to ~BOOK_CHARS_PER_LINE per line; preserve paragraph breaks.
+// Greedy word-wrap to ~book_chars_per_line per line; preserve paragraph breaks.
 static std::vector<std::string> wrap_text(const std::string &text) {
     std::vector<std::string> lines;
     std::string para;
@@ -216,7 +286,7 @@ static std::vector<std::string> wrap_text(const std::string &text) {
                     if (!word.empty()) {
                         if (current.empty()) {
                             current = word;
-                        } else if ((int)(current.size() + 1 + word.size()) <= BOOK_CHARS_PER_LINE) {
+                        } else if ((int)(current.size() + 1 + word.size()) <= book_chars_per_line) {
                             current += ' ';
                             current += word;
                         } else {
@@ -246,7 +316,7 @@ static std::vector<std::string> paginate_lines(const std::vector<std::string> &l
     std::string page;
     int n_in_page = 0;
     for (const auto &line : lines) {
-        if (n_in_page >= BOOK_LINES_PER_PAGE) {
+        if (n_in_page >= book_lines_per_page) {
             pages.push_back(page);
             page.clear();
             n_in_page = 0;
@@ -299,42 +369,49 @@ static void chapter_load_task(void *param) {
     vTaskDelete(NULL);
 }
 
-// SD path "/<book-without-extension>.pos" for the selected book.
-static String pos_path_for_selected() {
-    String name = String(books[selected].c_str());
+// SD path "/<book-without-extension>.pos" for any book by filename.
+static String pos_path_for_name(const String &name) {
     int dot = name.lastIndexOf('.');
     if (dot <= 0) dot = name.length();
     return String("/") + name.substring(0, dot) + ".pos";
 }
 
-static void save_position() {
-    if (selected < 0 || selected >= (int)books.size()) return;
-    String path = pos_path_for_selected();
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) { Serial.printf("save_position: open %s failed\n", path.c_str()); return; }
-    f.printf("%d %d\n", current_spine, current_page_in_chapter);
-    f.close();
-    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d\n",
-                  path.c_str(), current_spine, current_page_in_chapter);
-}
-
-// Returns true if a position was loaded; sets *out_spine and *out_page.
-static bool load_position(int *out_spine, int *out_page) {
-    if (selected < 0 || selected >= (int)books.size()) return false;
-    String path = pos_path_for_selected();
-    File f = SD.open(path, FILE_READ);
+static bool read_position_for_name(const String &name, int *out_spine, int *out_page) {
+    File f = SD.open(pos_path_for_name(name), FILE_READ);
     if (!f) return false;
     String line = f.readStringUntil('\n');
     f.close();
-    int sp_idx = -1, pg_idx = -1;
-    if (sscanf(line.c_str(), "%d %d", &sp_idx, &pg_idx) == 2) {
-        *out_spine = sp_idx;
-        *out_page = pg_idx;
-        Serial.printf("[POS_LOADED] %s -> ch=%d p=%d\n",
-                      path.c_str(), sp_idx, pg_idx);
+    int sp = -1, pg = -1;
+    if (sscanf(line.c_str(), "%d %d", &sp, &pg) == 2) {
+        *out_spine = sp;
+        *out_page = pg;
         return true;
     }
     return false;
+}
+
+static bool write_position_for_name(const String &name, int spine, int page) {
+    String path = pos_path_for_name(name);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { Serial.printf("write_position: open %s failed\n", path.c_str()); return false; }
+    f.printf("%d %d\n", spine, page);
+    f.close();
+    Serial.printf("[POS_SAVED] %s -> ch=%d p=%d\n", path.c_str(), spine, page);
+    return true;
+}
+
+static void save_position() {
+    if (selected < 0 || selected >= (int)books.size()) return;
+    write_position_for_name(String(books[selected].c_str()),
+                            current_spine, current_page_in_chapter);
+}
+
+static bool load_position(int *out_spine, int *out_page) {
+    if (selected < 0 || selected >= (int)books.size()) return false;
+    bool ok = read_position_for_name(String(books[selected].c_str()),
+                                     out_spine, out_page);
+    if (ok) Serial.printf("[POS_LOADED] ch=%d p=%d\n", *out_spine, *out_page);
+    return ok;
 }
 
 // Spawn the load task and wait for it.
@@ -449,7 +526,7 @@ static void render_book_page_text(int x_start, int target_w, int32_t y0, uint8_t
             render_line((GFXfont *)&FiraSans, line.c_str(),
                         x_start, target_w, cy, fb, !last_of_para);
         }
-        cy += BOOK_LINE_HEIGHT;
+        cy += book_line_height;
     }
 }
 
@@ -607,13 +684,14 @@ static void open_selected() {
 
 // ---- Phase E: WiFi AP + web upload server ----
 
-static WebServer *web_server = nullptr;
+static AsyncWebServer *web_server = nullptr;
 static DNSServer *dns_server = nullptr;
 static bool ap_active = false;
 static String ap_ssid;
 static String ap_password;
 static uint32_t ap_last_activity = 0;
-static const uint32_t AP_IDLE_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 min
+// Computed at AP entry from g_settings.ap_idle_minutes.
+static uint32_t ap_idle_timeout_ms = 5UL * 60UL * 1000UL;
 static File ap_upload_file;
 
 static const char *AP_SSID_FIXED = "tiny-reader";
@@ -636,7 +714,14 @@ static String ap_build_books_json() {
                 String esc = name;
                 esc.replace("\\", "\\\\");
                 esc.replace("\"", "\\\"");
-                json += "{\"name\":\"" + esc + "\",\"size\":" + String(f.size()) + "}";
+                int sp = 0, pg = 0;
+                bool has_pos = read_position_for_name(name, &sp, &pg);
+                json += "{\"name\":\"" + esc + "\"";
+                json += ",\"size\":" + String(f.size());
+                json += ",\"spine\":" + String(sp);
+                json += ",\"page\":" + String(pg);
+                json += ",\"hasPos\":" + String(has_pos ? "true" : "false");
+                json += "}";
             }
         }
         f.close();
@@ -682,18 +767,23 @@ static void render_ap_screen() {
 
 static const char AP_INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html>
-<html><head><meta name=viewport content="width=device-width,initial-scale=1"/>
+<html><head><meta charset="UTF-8"/>
+<meta name=viewport content="width=device-width,initial-scale=1"/>
 <title>tiny-reader</title>
 <style>
 body{font-family:-apple-system,sans-serif;max-width:640px;margin:0 auto;padding:1em;}
 h1{font-size:1.4em;}
-.book{padding:.6em;border-bottom:1px solid #ccc;display:flex;align-items:center;gap:.5em;}
+.book{padding:.6em;border-bottom:1px solid #ccc;}
+.book-row{display:flex;align-items:center;gap:.5em;}
 .book-name{flex:1;word-break:break-all;}
-.book-size{color:#666;font-size:.85em;}
-button{font-size:1em;padding:.4em .8em;}
+.book-meta{color:#666;font-size:.85em;display:flex;gap:.6em;margin-top:.2em;}
+button{font-size:.95em;padding:.4em .8em;}
+.btn-link{background:none;border:none;color:#06c;padding:0;cursor:pointer;text-decoration:underline;}
 form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 .danger{background:#fee;color:#900;border:1px solid #c66;}
 .muted{color:#666;font-size:.9em;}
+.editor{margin-top:.4em;padding:.4em;background:#f5f5f5;border-radius:4px;display:flex;align-items:center;gap:.4em;flex-wrap:wrap;}
+.editor input{width:5em;font-size:1em;padding:.2em;}
 </style></head><body>
 <h1>tiny-reader</h1>
 <div id=books class=muted>loading...</div>
@@ -703,12 +793,69 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
 <button>upload</button>
 <div id=status class=muted></div>
 </form>
+<form id=sf onsubmit="saveSettings(event)">
+<h3>settings</h3>
+<label>text density
+ <select name=density id=density>
+  <option value=0>compact (more text per page)</option>
+  <option value=1>medium (default)</option>
+  <option value=2>loose (more breathing room)</option>
+ </select>
+</label>
+<br><br>
+<label>WiFi share auto-exit after
+ <input type=number name=ap_idle_minutes id=apidle min=1 max=120 step=1 style="width:5em">
+ minutes idle
+</label>
+<br><br>
+<button>save settings</button>
+<div id=settings_status class=muted></div>
+</form>
 <script>
+ var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
+ var jsq=function(s){return s.replace(/\\/g,'\\\\').replace(/'/g,"\\'");};
  var load=function(){
   fetch('/api/books').then(function(r){return r.json();}).then(function(list){
    var d=document.getElementById('books');
-   d.innerHTML=list.length? list.map(function(b){return '<div class=book><span class=book-name>'+b.name+'</span><span class=book-size>'+(b.size/1024).toFixed(0)+'KB</span><a href="/api/books/'+encodeURIComponent(b.name)+'" download>download</a> <button class=danger onclick="del(\''+b.name+'\')">delete</button></div>';}).join('') : '<p class=muted>(empty)</p>';
+   if(!list.length){d.innerHTML='<p class=muted>(empty)</p>';return;}
+   d.innerHTML=list.map(function(b){
+    var pos = b.hasPos? ('ch '+(b.spine+1)+', page '+(b.page+1)) : 'not started';
+    return '<div class=book>'+
+     '<div class=book-row>'+
+      '<span class=book-name>'+esc(b.name)+'</span>'+
+      '<button class=danger onclick="del(\''+jsq(b.name)+'\')">delete</button>'+
+     '</div>'+
+     '<div class=book-meta>'+
+      '<span>'+(b.size/1024).toFixed(0)+'KB</span>'+
+      '<span>'+pos+'</span>'+
+      '<a href="/api/books/'+encodeURIComponent(b.name)+'" download>download</a>'+
+      '<button class=btn-link onclick="editPos(\''+jsq(b.name)+'\','+b.spine+','+b.page+')">edit position</button>'+
+     '</div>'+
+     '<div class=editor id="ed-'+esc(b.name)+'" style="display:none"></div>'+
+    '</div>';
+   }).join('');
   });
+ };
+ var editPos=function(name,sp,pg){
+  var sel='#ed-'+CSS.escape(name);
+  var ed=document.querySelector(sel);
+  ed.style.display='flex';
+  ed.innerHTML='chapter <input id=sp value='+(sp+1)+' min=1> page <input id=pg value='+(pg+1)+' min=1> '+
+   '<button class=btn-link onclick="savePos(\''+jsq(name)+'\')">save</button>'+
+   '<button class=btn-link onclick="cancelPos(\''+jsq(name)+'\')">cancel</button>';
+ };
+ var cancelPos=function(name){
+  var ed=document.querySelector('#ed-'+CSS.escape(name));
+  ed.style.display='none'; ed.innerHTML='';
+ };
+ var savePos=function(name){
+  var ed=document.querySelector('#ed-'+CSS.escape(name));
+  var sp=Math.max(0,parseInt(ed.querySelector('#sp').value,10)-1);
+  var pg=Math.max(0,parseInt(ed.querySelector('#pg').value,10)-1);
+  var fd=new URLSearchParams(); fd.append('spine',sp); fd.append('page',pg);
+  fetch('/api/books/'+encodeURIComponent(name)+'/pos',
+        {method:'POST',body:fd,headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){if(r.ok){load();}else{alert('save failed');}});
  };
  var upload=function(e){
   e.preventDefault();
@@ -726,80 +873,185 @@ form{margin-top:1em;padding:1em;border:1px solid #ccc;border-radius:6px;}
    if(r.ok) load(); else alert('delete failed');
   });
  };
+ var loadSettings=function(){
+  fetch('/api/settings').then(function(r){return r.json();}).then(function(s){
+   document.getElementById('density').value=s.density;
+   document.getElementById('apidle').value=s.ap_idle_minutes;
+  });
+ };
+ var saveSettings=function(e){
+  e.preventDefault();
+  var st=document.getElementById('settings_status');
+  var fd=new URLSearchParams();
+  fd.append('density',document.getElementById('density').value);
+  fd.append('ap_idle_minutes',document.getElementById('apidle').value);
+  st.textContent='saving...';
+  fetch('/api/settings',{method:'POST',body:fd,
+        headers:{'Content-Type':'application/x-www-form-urlencoded'}})
+   .then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
+   })
+   .then(function(j){
+    st.textContent=j.changed? 'saved (applies on next book open)'
+                            : 'saved (no changes)';
+   })
+   .catch(function(err){
+    st.textContent='save failed: '+err.message;
+   });
+ };
  load();
+ loadSettings();
 </script></body></html>
 )HTML";
 
-static void ap_handle_root() {
+// Async handlers below take AsyncWebServerRequest *req.
+static void ap_handle_root(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    web_server->send_P(200, "text/html", AP_INDEX_HTML);
+    AsyncWebServerResponse *r = req->beginResponse_P(200, "text/html; charset=utf-8", AP_INDEX_HTML);
+    req->send(r);
 }
-static void ap_handle_books_json() {
+static void ap_handle_settings_get(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    web_server->send(200, "application/json", ap_build_books_json());
+    Serial.printf("[HTTP] GET /api/settings (density=%d ap_idle=%d)\n",
+                  g_settings.density, g_settings.ap_idle_minutes);
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "{\"density\":%d,\"ap_idle_minutes\":%d}",
+             g_settings.density, g_settings.ap_idle_minutes);
+    req->send(200, "application/json", buf);
 }
-static void ap_handle_upload_progress() {
+
+static void ap_handle_settings_post(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    HTTPUpload &u = web_server->upload();
-    if (u.status == UPLOAD_FILE_START) {
-        String path = String("/") + u.filename;
+    Serial.printf("[HTTP] POST /api/settings — params: %d\n", req->params());
+    for (size_t i = 0; i < req->params(); ++i) {
+        const AsyncWebParameter *p = req->getParam(i);
+        Serial.printf("  - %s = %s (post=%d)\n",
+                      p->name().c_str(), p->value().c_str(), p->isPost());
+    }
+    bool changed = false;
+    if (req->hasParam("density", true)) {
+        int d = req->getParam("density", true)->value().toInt();
+        if (d >= 0 && d <= 2 && d != g_settings.density) {
+            g_settings.density = d;
+            changed = true;
+        }
+    }
+    if (req->hasParam("ap_idle_minutes", true)) {
+        int m = req->getParam("ap_idle_minutes", true)->value().toInt();
+        if (m >= 1 && m <= 120 && m != g_settings.ap_idle_minutes) {
+            g_settings.ap_idle_minutes = m;
+            // Apply to the live session too so the user doesn't have to
+            // re-enter AP for a longer timeout to take effect.
+            ap_idle_timeout_ms = (uint32_t)m * 60UL * 1000UL;
+            Serial.printf("[AP] idle timeout updated live to %d min\n", m);
+            changed = true;
+        }
+    }
+    if (changed) {
+        save_settings();
+        apply_density();
+    }
+    req->send(200, "application/json", changed ? "{\"ok\":true,\"changed\":true}"
+                                                : "{\"ok\":true,\"changed\":false}");
+}
+
+static void ap_handle_books_json(AsyncWebServerRequest *req) {
+    ap_last_activity = millis();
+    String json = ap_build_books_json();
+    Serial.printf("[HTTP] GET /api/books -> %d bytes\n", json.length());
+    req->send(200, "application/json", json);
+}
+
+// Multipart upload: AsyncWebServer calls back per-chunk.
+static void ap_handle_upload_chunk(AsyncWebServerRequest *req, String filename,
+                                   size_t index, uint8_t *data, size_t len, bool final) {
+    ap_last_activity = millis();
+    if (index == 0) {
+        String path = String("/") + filename;
         if (SD.exists(path)) SD.remove(path);
         ap_upload_file = SD.open(path, FILE_WRITE);
         Serial.printf("[UPLOAD] start %s\n", path.c_str());
-    } else if (u.status == UPLOAD_FILE_WRITE) {
-        if (ap_upload_file) ap_upload_file.write(u.buf, u.currentSize);
-    } else if (u.status == UPLOAD_FILE_END) {
-        if (ap_upload_file) {
-            ap_upload_file.close();
-            Serial.printf("[UPLOAD] done %u bytes\n", (unsigned)u.totalSize);
-        }
+    }
+    if (ap_upload_file && len) {
+        ap_upload_file.write(data, len);
+    }
+    if (final) {
+        if (ap_upload_file) ap_upload_file.close();
+        Serial.printf("[UPLOAD] done %u bytes\n", (unsigned)(index + len));
     }
 }
-static void ap_handle_upload_done() {
-    web_server->send(200, "application/json", "{\"ok\":true}");
+static void ap_handle_upload_done(AsyncWebServerRequest *req) {
+    req->send(200, "application/json", "{\"ok\":true}");
 }
-static void ap_handle_book_path() {
+
+// Common /api/books/<name>... handler
+static void ap_handle_book_path(AsyncWebServerRequest *req) {
     ap_last_activity = millis();
-    String uri = web_server->uri();
+    String uri = req->url();
     if (!uri.startsWith("/api/books/")) {
-        web_server->send(404, "text/plain", "not found");
+        req->send(404, "text/plain", "not found");
         return;
     }
-    String name = uri.substring(strlen("/api/books/"));
-    name = web_server->urlDecode(name);
+    String tail = uri.substring(strlen("/api/books/"));
+    String name = tail, action;
+    int slash = tail.lastIndexOf('/');
+    if (slash > 0) {
+        action = tail.substring(slash + 1);
+        name = tail.substring(0, slash);
+    }
+    // AsyncWebServer auto-decodes URI; it's already decoded in url()
     String path = String("/") + name;
-    if (web_server->method() == HTTP_DELETE) {
+
+    if (action == "pos") {
+        if (req->method() == HTTP_GET) {
+            int sp = 0, pg = 0;
+            bool ok = read_position_for_name(name, &sp, &pg);
+            char buf[80];
+            snprintf(buf, sizeof(buf), "{\"spine\":%d,\"page\":%d,\"saved\":%s}",
+                     sp, pg, ok ? "true" : "false");
+            req->send(200, "application/json", buf);
+        } else if (req->method() == HTTP_POST) {
+            int sp = 0, pg = 0;
+            if (req->hasParam("spine", true)) sp = req->getParam("spine", true)->value().toInt();
+            if (req->hasParam("page",  true)) pg = req->getParam("page",  true)->value().toInt();
+            if (sp < 0) sp = 0;
+            if (pg < 0) pg = 0;
+            bool ok = write_position_for_name(name, sp, pg);
+            req->send(ok ? 200 : 500, "application/json",
+                      ok ? "{\"ok\":true}" : "{\"error\":\"write failed\"}");
+        } else {
+            req->send(405, "text/plain", "method not allowed");
+        }
+        return;
+    }
+
+    if (req->method() == HTTP_DELETE) {
         if (SD.exists(path)) {
             SD.remove(path);
-            // also remove sidecar .pos
-            int dot = name.lastIndexOf('.');
-            if (dot > 0) {
-                String pos_path = String("/") + name.substring(0, dot) + ".pos";
-                if (SD.exists(pos_path)) SD.remove(pos_path);
-            }
-            web_server->send(200, "application/json", "{\"ok\":true}");
+            String pos_path = pos_path_for_name(name);
+            if (SD.exists(pos_path)) SD.remove(pos_path);
+            req->send(200, "application/json", "{\"ok\":true}");
         } else {
-            web_server->send(404, "application/json", "{\"error\":\"not found\"}");
+            req->send(404, "application/json", "{\"error\":\"not found\"}");
         }
     } else {
-        File f = SD.open(path, FILE_READ);
-        if (!f) {
-            web_server->send(404, "application/json", "{\"error\":\"not found\"}");
+        if (!SD.exists(path)) {
+            req->send(404, "application/json", "{\"error\":\"not found\"}");
             return;
         }
-        web_server->streamFile(f, "application/epub+zip");
-        f.close();
+        req->send(SD, path, "application/epub+zip");
     }
 }
 
-static void ap_handle_not_found() {
-    String uri = web_server->uri();
-    if (uri.startsWith("/api/books/")) { ap_handle_book_path(); return; }
-    // Captive-portal probes: redirect everything to our index so the phone
-    // recognises this as a portal and doesn't switch back to mobile data.
+static void ap_handle_not_found(AsyncWebServerRequest *req) {
+    String uri = req->url();
+    if (uri.startsWith("/api/books/")) { ap_handle_book_path(req); return; }
     Serial.printf("[HTTP] catchall %s\n", uri.c_str());
-    web_server->sendHeader("Location", "/", true);
-    web_server->send(302, "text/plain", "");
+    AsyncWebServerResponse *r = req->beginResponse(302, "text/plain", "");
+    r->addHeader("Location", "/");
+    req->send(r);
 }
 
 static uint32_t ap_started_at = 0;
@@ -821,10 +1073,32 @@ static void enter_ap_mode() {
     ap_ssid = AP_SSID_FIXED;
     ap_password = AP_PASSWORD_FIXED;
 
-    WiFi.onEvent(on_wifi_event);
     WiFi.mode(WIFI_AP);
     WiFi.softAP(ap_ssid.c_str(), ap_password.c_str());
+    WiFi.setSleep(false);   // keep radio on; AP power-save drops connections.
     delay(200);
+
+    // DHCP-DNS hijack: tell connecting phones to use 192.168.4.1 as their DNS.
+    // Without this, phones resolve connectivitycheck.gstatic.com via cellular
+    // DNS, fail (no internet path), declare "no internet" and drop the link.
+    // Have to stop dhcps, set option + DNS, then restart.
+    {
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (ap_netif) {
+            esp_netif_dns_info_t dns_info = {};
+            IP_ADDR4(&dns_info.ip, 192, 168, 4, 1);
+            esp_netif_dhcps_stop(ap_netif);
+            uint8_t opt_val = 1;  // OFFER_DNS = 1
+            esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                                   ESP_NETIF_DOMAIN_NAME_SERVER,
+                                   &opt_val, sizeof(opt_val));
+            esp_netif_set_dns_info(ap_netif, ESP_NETIF_DNS_MAIN, &dns_info);
+            esp_netif_dhcps_start(ap_netif);
+            Serial.println("[AP] DHCP advertising 192.168.4.1 as DNS");
+        } else {
+            Serial.println("[AP] WIFI_AP_DEF netif not found; DHCP-DNS skip");
+        }
+    }
 
     IPAddress ip = WiFi.softAPIP();
 
@@ -837,21 +1111,47 @@ static void enter_ap_mode() {
     if (!MDNS.begin(MDNS_HOSTNAME)) Serial.println("[AP] mDNS begin failed");
     MDNS.addService("http", "tcp", 80);
 
-    web_server = new WebServer(80);
+    web_server = new AsyncWebServer(80);
     web_server->on("/", HTTP_GET, ap_handle_root);
     web_server->on("/api/books", HTTP_GET, ap_handle_books_json);
-    web_server->on("/upload", HTTP_POST,
-                   ap_handle_upload_done, ap_handle_upload_progress);
-    // Captive-portal probes from Apple/Android/Microsoft
-    web_server->on("/generate_204", HTTP_GET, ap_handle_root);
-    web_server->on("/hotspot-detect.html", HTTP_GET, ap_handle_root);
-    web_server->on("/connecttest.txt", HTTP_GET, ap_handle_root);
+    web_server->on("/api/settings", HTTP_GET, ap_handle_settings_get);
+    web_server->on("/api/settings", HTTP_POST, ap_handle_settings_post);
+    web_server->on("/ping", HTTP_GET, [](AsyncWebServerRequest *r) {
+        Serial.println("[HTTP] GET /ping");
+        r->send(200, "text/plain", "pong");
+    });
+    // /upload — multipart POST, called as upload chunks stream in
+    web_server->on("/upload", HTTP_POST, ap_handle_upload_done,
+                   ap_handle_upload_chunk);
+    // Captive-portal probes — return what each OS expects so the device
+    // considers the network "online" and doesn't restrict fetches.
+    web_server->on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204, "text/plain", "");
+    });
+    web_server->on("/gen_204", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204, "text/plain", "");
+    });
+    web_server->on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html",
+            "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    });
+    web_server->on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html",
+            "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    });
+    web_server->on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft Connect Test");
+    });
+    web_server->on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft NCSI");
+    });
     web_server->onNotFound(ap_handle_not_found);
     web_server->begin();
 
     ap_active = true;
     ap_last_activity = millis();
     ap_started_at = millis();
+    ap_idle_timeout_ms = (uint32_t)g_settings.ap_idle_minutes * 60UL * 1000UL;
     Serial.printf("[AP] up: SSID=%s pw=%s ip=%s\n",
                   ap_ssid.c_str(), ap_password.c_str(),
                   WiFi.softAPIP().toString().c_str());
@@ -863,7 +1163,7 @@ static void exit_ap_mode() {
     if (!ap_active) return;
     Serial.println("[AP] exit_ap_mode() called");
     if (web_server) {
-        web_server->stop();
+        web_server->end();
         delete web_server;
         web_server = nullptr;
     }
@@ -934,6 +1234,12 @@ void setup() {
     // strobe (see ed047tc1.h: CFG_STR = GPIO_NUM_0). Configuring it as a button
     // input fights the display driver's output mode and the screen stops
     // refreshing. So we don't use STR_100 as a button. See backlog #15.
+
+    // Register WiFi event callback once (was inside enter_ap_mode → stacked).
+    WiFi.onEvent(on_wifi_event);
+
+    load_settings();
+    apply_density();
 
     scan_sd_for_epubs();
     clear_and_flush();
@@ -1025,8 +1331,8 @@ void loop() {
     // ---- AP / web-server mode ----
     if (ap_active) {
         if (dns_server) dns_server->processNextRequest();
-        web_server->handleClient();
-        if (now - ap_last_activity > AP_IDLE_TIMEOUT_MS) {
+        // AsyncWebServer runs its own task; no handleClient() needed.
+        if (now - ap_last_activity > ap_idle_timeout_ms) {
             Serial.println("[AP] idle timeout");
             exit_ap_mode();
             return;
@@ -1064,7 +1370,11 @@ void loop() {
                               xs[0], ys[0], zone, app_mode);
                 Serial.flush();
                 if (app_mode == MODE_BOOK) {
-                    if (xs[0] < EPD_WIDTH / 2) book_prev_page();
+                    if (ys[0] < 80) {
+                        Serial.println("[TAP] top → back to library");
+                        app_mode = MODE_LIBRARY;
+                        render_book_list();
+                    } else if (xs[0] < EPD_WIDTH / 2) book_prev_page();
                     else book_next_page();
                 } else {
                     if (zone == 1) move_selection(-1);

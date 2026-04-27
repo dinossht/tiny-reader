@@ -32,20 +32,29 @@ pio run -t upload --upload-port /dev/ttyACM0
 The first build downloads the ESP-IDF toolchain + libs (~5 min). Subsequent
 builds are seconds. Monitor with `pio device monitor --port /dev/ttyACM0`.
 
-## WiFi share mode
+## The hub (WiFi share mode)
 
-Long-press the GPIO21 button for ≥ 2 seconds → device spins up a WiFi access
-point and shows the credentials on screen.
+Long-press the GPIO21 / SENSOR_VN button for ≥ 2 seconds → the device spins up
+a WiFi access point and shows the credentials on the e-paper.
 
 - **SSID:** `tiny-reader`
 - **Password:** `bv-birdy`
-- **URL:** `http://tiny-reader.local` (mDNS) or `http://192.168.4.1`
+- **URL:** `http://192.168.4.1` (recommended) or `http://tiny-reader.local`
 
-> Note: phones often disconnect from the AP within seconds because our DHCP
-> server doesn't yet advertise itself as the DNS, so captive-portal probes
-> time out and the phone decides "no internet". **Laptops work fine.** Open
-> the URL above in any browser to manage your library. Auto-exits after 5 min
-> idle, or hold the button for ≥ 1.5 s to exit.
+The hub web UI lets you:
+- list books with current reading position
+- upload `.epub` files from your phone or laptop
+- delete books (also removes the position sidecar)
+- download books back
+- **edit reading position per book** (jump to any chapter/page; saved to the
+  `.pos` sidecar, picked up on next open)
+
+Auto-exits after 5 min of HTTP idle, or hold the button ≥ 1.5 s to exit.
+
+> Note on phones: phones often disconnect from the AP within seconds because
+> our DHCP server doesn't yet advertise itself as the DNS, so captive-portal
+> probes can't resolve and the phone decides "no internet". **Laptops work
+> fine** — use the IP, not mDNS. Phone support is on the backlog.
 
 ## Serial commands
 
@@ -53,14 +62,15 @@ While connected via `pio device monitor`, you can drive the device:
 
 ```
 help
-next
-prev
-back
-open <n>      # n = book index in library
-goto <ch>     # ch = chapter index (0-based)
-dump          # dump current page or library to serial
-share         # enter WiFi share mode
-stop_share
+next                # advance one page (book mode)
+prev                # back one page
+back                # back to library (book mode)
+open <n>            # n = book index in library
+goto <ch>           # ch = chapter index (0-based)
+dump                # dump current page or library to serial
+share               # enter WiFi share mode
+stop_share          # exit WiFi share mode
+probe_buttons       # 30 s GPIO read of likely button pins (hardware bring-up)
 ```
 
 The firmware also emits `[PAGE_BEGIN ch=N/M p=A/B] ... [PAGE_END]` markers
