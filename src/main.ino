@@ -26,7 +26,9 @@
 
 #include "epd_driver.h"
 #include "firasans.h"
-#include "firasans_small.h"   // smaller bitmap font for footer/status lines
+#include "firasans_small.h"      // smaller bitmap font for footer/status lines
+#include "freesans_body_small.h" // 18pt body font used for "compact" density
+#include "logo.h"                // 1-bit packed boot-splash logo
 #include "utilities.h"
 #include <TouchDrvGT911.hpp>
 #include "Epub.h"
@@ -70,6 +72,9 @@ static std::vector<std::string> chapter_pages;  // each entry = one page of \n-s
 static const int BOOK_MARGIN_X = 50;
 static const int BOOK_TOP_RESERVE = 30;     // small visual margin only
 static const int BOOK_FOOTER_RESERVE = 50;
+// Body font and layout values driven by the user's "density" setting (see
+// g_settings + apply_density()).
+static const GFXfont *g_body_font = (const GFXfont *)&FiraSans;
 // Layout values that depend on the user's "density" setting (see g_settings).
 // FiraSans advance_y is 50 — line_height < 50 would overlap glyphs.
 static int book_line_height = 50;
@@ -104,25 +109,39 @@ static bool sample_str100_button() {
 
 static void apply_density() {
     switch (g_settings.density) {
-        case 0:  // compact — same line height, slightly more chars per line.
-                 // 48 chars stays inside 860px body width on FiraSans (52
-                 // overflowed on long lines).
-            book_line_height = 50;
-            book_chars_per_line = 48;
+        case 0:  // compact — uses an 18pt FreeSans body so a lot more text
+                 // fits on a page; line height matches the smaller font.
+            g_body_font = (const GFXfont *)&freesans_body_small;
+            book_line_height = 42;
+            book_chars_per_line = 70;
             break;
-        case 2:  // loose — extra leading between lines, fewer chars per line
-            book_line_height = 60;
-            book_chars_per_line = 36;
+        case 2:  // loose — same body font as medium but airy: extra leading
+                 // and short lines.
+            g_body_font = (const GFXfont *)&FiraSans;
+            book_line_height = 72;
+            book_chars_per_line = 30;
             break;
         case 1:  // medium (default)
         default:
             g_settings.density = 1;
+            g_body_font = (const GFXfont *)&FiraSans;
             book_line_height = 50;
             book_chars_per_line = 44;
             break;
     }
-    book_lines_per_page =
-        (EPD_HEIGHT - BOOK_TOP_RESERVE - BOOK_FOOTER_RESERVE) / book_line_height;
+    // Lines per page = (max baseline range) / line_height + 1.
+    // First line's baseline sits at BOOK_TOP_RESERVE+30 (matches the y0
+    // passed to render_book_page_text). Last line's baseline must leave
+    // ~10 px of descender slack above the footer reserve. The previous
+    // formula treated the available area as N×line_height bands and
+    // truncated, which lost a usable line in compact mode.
+    {
+        const int first_baseline = BOOK_TOP_RESERVE + 30;
+        const int last_baseline_max =
+            EPD_HEIGHT - BOOK_FOOTER_RESERVE - 10;
+        book_lines_per_page =
+            (last_baseline_max - first_baseline) / book_line_height + 1;
+    }
     Serial.printf("[SETTINGS] density=%d -> line_h=%d lines/page=%d chars/line=%d\n",
                   g_settings.density, book_line_height,
                   book_lines_per_page, book_chars_per_line);
@@ -359,7 +378,7 @@ static std::string strip_xhtml(const char *src, size_t len) {
 static std::vector<std::string> wrap_text(const std::string &text) {
     std::vector<std::string> lines;
     const int target_w = EPD_WIDTH - 2 * BOOK_MARGIN_X;
-    const GFXfont *font = (const GFXfont *)&FiraSans;
+    const GFXfont *font = g_body_font;
 
     auto measure = [font](const char *s) -> int {
         int32_t mx = 0, my = 0, mx1, my1, mw, mh;
@@ -694,7 +713,7 @@ static void render_book_page_text(int x_start, int target_w, int32_t y0, uint8_t
         bool last_of_para = (i + 1 >= lines.size()) || lines[i + 1].empty();
         bool blank = line.empty();
         if (!blank) {
-            render_line((GFXfont *)&FiraSans, line.c_str(),
+            render_line((GFXfont *)g_body_font, line.c_str(),
                         x_start, target_w, cy, fb, !last_of_para);
         }
         cy += book_line_height;
@@ -731,6 +750,26 @@ static void fill_rect(int x0, int y0, int x1, int y1, uint8_t *fb) {
         for (int x = x0; x < x1; ++x) {
             int idx = (y * EPD_WIDTH + x) / 2;
             fb[idx] &= (x & 1) ? 0x0F : 0xF0;
+        }
+    }
+}
+
+// Blit a 1-bit packed bitmap (MSB-first within each byte, row-padded to a
+// byte boundary; bit=1 = black, bit=0 = white/transparent) into the 4-bit
+// framebuffer at top-left (x0, y0). Used for the boot-splash logo.
+static void blit_1bit(int x0, int y0, int w, int h,
+                      const uint8_t *bits, uint8_t *fb) {
+    int row_bytes = (w + 7) / 8;
+    for (int y = 0; y < h; ++y) {
+        int dy = y0 + y;
+        if (dy < 0 || dy >= EPD_HEIGHT) continue;
+        const uint8_t *row = bits + y * row_bytes;
+        for (int x = 0; x < w; ++x) {
+            if (!(row[x >> 3] & (0x80 >> (x & 7)))) continue;
+            int dx = x0 + x;
+            if (dx < 0 || dx >= EPD_WIDTH) continue;
+            int idx = (dy * EPD_WIDTH + dx) / 2;
+            fb[idx] &= (dx & 1) ? 0x0F : 0xF0;   // black nibble
         }
     }
 }
@@ -918,67 +957,96 @@ static void render_book_list() {
     dump_library_to_serial();
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
 
-    int32_t cx = LIST_X, cy = LIST_Y;
-    char header[96];
-    snprintf(header, sizeof(header), "Library  (%u %s)",
-             (unsigned)books.size(),
-             books.size() == 1 ? "book" : "books");
-    writeln((GFXfont *)&FiraSans, header, &cx, &cy, framebuffer);
+    const GFXfont *body  = (GFXfont *)&FiraSans;
+    const GFXfont *small = (const GFXfont *)&firasans_small;
 
-    if (books.empty()) {
-        cx = LIST_X; cy = LIST_Y + 120;
-        writeln((GFXfont *)&FiraSans, "No books on the SD card.",
-                &cx, &cy, framebuffer);
-        cx = LIST_X; cy = LIST_Y + 180;
-        writeln((GFXfont *)&FiraSans,
-                "Hold the button >= 2s to enter WiFi share mode,",
-                &cx, &cy, framebuffer);
-        cx = LIST_X; cy = LIST_Y + 240;
-        writeln((GFXfont *)&FiraSans,
-                "then upload .epub files via the hub.",
-                &cx, &cy, framebuffer);
-    } else {
+    // Page indicator (top-right) only when the library spans >1 page.
+    if (!books.empty()) {
         int total_pages = (books.size() + LINES_PER_PAGE - 1) / LINES_PER_PAGE;
         int cur_page = page_first / LINES_PER_PAGE;
-        cx = EPD_WIDTH - 240;
-        cy = LIST_Y;
-        char pageinfo[32];
-        snprintf(pageinfo, sizeof(pageinfo), "page %d / %d",
-                 cur_page + 1, total_pages > 0 ? total_pages : 1);
-        writeln((GFXfont *)&FiraSans, pageinfo, &cx, &cy, framebuffer);
-
-        int row = 0;
-        for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
-            const char *prefix = ((int)i == selected) ? ">" : " ";
-            // Title line
-            cx = LIST_X + 40;
-            cy = LIST_Y + 60 + row * LINE_HEIGHT;
-            std::string title = books[i];
-            size_t dot = title.rfind(".epub");
-            if (dot != std::string::npos) title.erase(dot);
-            if (title.size() > 48) title = title.substr(0, 45) + "...";
-            std::string line = std::string(prefix) + " " + title;
-            writeln((GFXfont *)&FiraSans, line.c_str(), &cx, &cy, framebuffer);
-
-            // Saved position, right-aligned. Show progress % + page within
-            // chapter so it matches what the book footer shows. (We avoid
-            // a "ch N" label here because spine index ≠ TOC chapter number.)
-            int sp = 0, pg = 0, pct = 0;
-            if (read_position_for_name(String(books[i].c_str()), &sp, &pg, &pct)) {
-                char info[40];
-                if (pct > 0) snprintf(info, sizeof(info), "%d%%  p %d", pct, pg + 1);
-                else         snprintf(info, sizeof(info), "p %d", pg + 1);
-                int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-                get_text_bounds((GFXfont *)&FiraSans, info,
-                                &mx, &my, &mx1, &my1, &mw, &mh, NULL);
-                int32_t rx = EPD_WIDTH - LIST_X - mw;
-                int32_t ry = LIST_Y + 60 + row * LINE_HEIGHT;
-                writeln((GFXfont *)&FiraSans, info, &rx, &ry, framebuffer);
-            }
+        if (total_pages > 1) {
+            char pageinfo[32];
+            snprintf(pageinfo, sizeof(pageinfo), "page %d / %d",
+                     cur_page + 1, total_pages);
+            int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+            get_text_bounds(small, pageinfo, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+            int32_t rx = EPD_WIDTH - LIST_X - mw, ry = 30;
+            writeln(small, pageinfo, &rx, &ry, framebuffer);
+            draw_hline(45, LIST_X, EPD_WIDTH - LIST_X, framebuffer);
         }
     }
 
-    // (footer hints intentionally removed — clean library look)
+    if (books.empty()) {
+        int32_t cx = LIST_X, cy = LIST_Y + 100;
+        writeln(body, "No books on the SD card.",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy += 60;
+        writeln(small, "Hold the button >= 2s to enter WiFi share mode,",
+                &cx, &cy, framebuffer);
+        cx = LIST_X; cy += 36;
+        writeln(small, "then upload .epub files via the hub.",
+                &cx, &cy, framebuffer);
+    } else {
+        // Right-edge column reserved for the progress indicator (bar + label).
+        const int BAR_W = 120;
+        const int BAR_H = 12;
+        const int LABEL_W = 60;            // room for "100%" / "Done"
+        const int RIGHT_X = EPD_WIDTH - LIST_X;
+        const int BAR_X0 = RIGHT_X - BAR_W;
+        const int BAR_X1 = RIGHT_X;
+
+        int row = 0;
+        for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
+            bool sel = ((int)i == selected);
+            int32_t baseline = LIST_Y + 60 + row * LINE_HEIGHT;
+
+            // Cursor mark + title
+            std::string title = books[i];
+            size_t dot = title.rfind(".epub");
+            if (dot != std::string::npos) title.erase(dot);
+            if (title.size() > 38) title = title.substr(0, 35) + "...";
+            std::string line = std::string(sel ? "> " : "  ") + title;
+            int32_t tx = LIST_X, ty = baseline;
+            writeln(body, line.c_str(), &tx, &ty, framebuffer);
+
+            // Right-side state
+            int sp = 0, pg = 0, pct = 0;
+            bool has_pos = read_position_for_name(String(books[i].c_str()),
+                                                  &sp, &pg, &pct);
+            if (!has_pos) {
+                // unread — leave blank for a clean look
+                continue;
+            }
+            if (pct >= 99) {
+                // finished
+                const char *label = "Done";
+                int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+                get_text_bounds(small, label, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+                int32_t rx = RIGHT_X - mw, ry = baseline;
+                writeln(small, label, &rx, &ry, framebuffer);
+                continue;
+            }
+            // in progress: percent label + horizontal bar
+            char label[8];
+            snprintf(label, sizeof(label), "%d%%", pct);
+            int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+            get_text_bounds(small, label, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+            int32_t lblx = BAR_X0 - 8 - mw, lbly = baseline;
+            writeln(small, label, &lblx, &lbly, framebuffer);
+
+            int by0 = baseline - 22;
+            int by1 = by0 + BAR_H;
+            draw_hline(by0, BAR_X0, BAR_X1, framebuffer);
+            draw_hline(by1, BAR_X0, BAR_X1, framebuffer);
+            draw_vline(BAR_X0, by0, by1, framebuffer);
+            draw_vline(BAR_X1, by0, by1, framebuffer);
+            int inner_w = (BAR_X1 - BAR_X0) - 4;
+            int fill_w = (pct * inner_w + 50) / 100;
+            if (fill_w > 0)
+                fill_rect(BAR_X0 + 2, by0 + 2,
+                          BAR_X0 + 2 + fill_w, by1 - 1, framebuffer);
+        }
+    }
 
     epd_poweron();
     epd_clear();
@@ -1969,6 +2037,37 @@ void setup() {
 
     epd_init();
 
+    // ---- Boot splash ----
+    // Logo + "tiny-reader", centered. Drawn once on cold boot or
+    // wake-from-sleep, then overwritten by the first real render (library
+    // or auto-resumed book).
+    {
+        memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+        const GFXfont *body  = (GFXfont *)&FiraSans;
+        const char *title    = "tiny-reader";
+
+        const int GAP_LOGO_TITLE = 40;
+        int title_h = 50;   // FiraSans cap height ~ this
+        int stack_h = LOGO_H + GAP_LOGO_TITLE + title_h;
+        int stack_top = (EPD_HEIGHT - stack_h) / 2;
+
+        int logo_x = (EPD_WIDTH - LOGO_W) / 2;
+        int logo_y = stack_top;
+        blit_1bit(logo_x, logo_y, LOGO_W, LOGO_H, LOGO_BITMAP, framebuffer);
+
+        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+        get_text_bounds(body, title, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+        int32_t tx = (EPD_WIDTH - mw) / 2;
+        int32_t ty = logo_y + LOGO_H + GAP_LOGO_TITLE + title_h;
+        writeln(body, title, &tx, &ty, framebuffer);
+
+        epd_poweron();
+        epd_clear();
+        epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+        epd_poweroff();
+    }
+    uint32_t splash_started_ms = millis();
+
     // GT911 touch wakeup pulse, scan I²C for address, init driver
     pinMode(TOUCH_INT, OUTPUT);
     digitalWrite(TOUCH_INT, HIGH);
@@ -2006,6 +2105,15 @@ void setup() {
     load_todos();
 
     scan_sd_for_epubs();
+
+    // Hold the splash visible for at least ~2 s of total wall-clock time
+    // so the boot screen actually registers (most init steps above are
+    // fast). Then clear the screen for the real render that follows.
+    {
+        const uint32_t SPLASH_MS = 2000;
+        uint32_t shown = millis() - splash_started_ms;
+        if (shown < SPLASH_MS) delay(SPLASH_MS - shown);
+    }
     clear_and_flush();
 
     // If the last shutdown was from sleep while reading a book, auto-resume.
@@ -2186,6 +2294,23 @@ void loop() {
     uint32_t now = millis();
 
     handle_serial_commands();
+
+    // STR_100 polling outside renders. The EPD is idle between renders
+    // (every render ends with epd_poweroff), so it's safe to briefly flip
+    // GPIO 0 to INPUT_PULLUP and sample. We poll every ~100 ms instead of
+    // only at render time so press-while-idle actually registers. Skip
+    // while AP mode is active — WiFi/AsyncTCP are tetchy about long bursts
+    // of pin flipping during traffic, and STR_100 isn't bound there anyway.
+    if (!ap_active && !str100_pressed) {
+        static uint32_t str100_last_poll = 0;
+        if (now - str100_last_poll >= 100) {
+            str100_last_poll = now;
+            if (sample_str100_button()) {
+                Serial.println("[STR_100] press detected (loop poll)");
+                str100_pressed = true;
+            }
+        }
+    }
 
     // ---- AP / web-server mode ----
     if (ap_active) {
@@ -2402,16 +2527,35 @@ void loop() {
     // STR_100 button (GPIO 0): it shares the EPD CFG_STR strobe, so we can't
     // poll it from loop(). Instead the render functions sample it during the
     // post-poweroff idle window and set str100_pressed. Consume it here.
+    //
+    // In book mode, STR_100 cycles text density (compact → medium → loose).
+    // The current chapter is re-paginated and we keep the user roughly where
+    // they were by scaling page index by the old/new page counts.
     if (str100_pressed) {
         str100_pressed = false;
         if (now >= input_cooldown_until) {
             if (app_mode == MODE_BOOK) {
-                Serial.println("[STR_100] consumed → back to library");
-                app_mode = MODE_LIBRARY;
-                render_book_list();
+                int prev_pages = (int)chapter_pages.size();
+                int prev_page  = current_page_in_chapter;
+                g_settings.density = (g_settings.density + 1) % 3;
+                apply_density();
+                save_settings();
+                Serial.printf("[STR_100] density=%d, re-paginating ch %d\n",
+                              g_settings.density, current_spine);
+                if (load_chapter(current_spine)) {
+                    int new_pages = (int)chapter_pages.size();
+                    if (prev_pages > 0 && new_pages > 0) {
+                        int np = (int)((int64_t)prev_page * new_pages / prev_pages);
+                        if (np < 0) np = 0;
+                        if (np >= new_pages) np = new_pages - 1;
+                        current_page_in_chapter = np;
+                    }
+                    render_book_page();
+                    save_position();
+                }
                 input_cooldown_until = millis() + 600;
             } else {
-                Serial.println("[STR_100] consumed in library mode (no-op)");
+                Serial.println("[STR_100] consumed (no-op outside book mode)");
             }
         }
     }
