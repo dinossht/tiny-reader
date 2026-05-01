@@ -188,19 +188,73 @@ static void apply_density() {
 
 // ---- helpers ----
 
-// LilyGo V2.3: BATT_PIN = GPIO14, on a /2 voltage divider.
+// LilyGo V2.3: BATT_PIN = GPIO14, on a /2 voltage divider. ADC1.
+// Average 8 samples to smooth out the ESP32-S3 SAR-ADC's per-sample noise
+// (typically ±10 mV at this attenuation), which is otherwise enough to
+// flicker the percent reading by a couple of points.
 static float read_battery_voltage() {
-    int raw = analogRead(BATT_PIN);
-    return (raw / 4095.0f) * 2.0f * 3.3f;
+    long sum = 0;
+    for (int i = 0; i < 8; ++i) sum += analogRead(BATT_PIN);
+    return (sum / 8.0f / 4095.0f) * 2.0f * 3.3f;
 }
 
-// Linear LiPo approximation: 100% @ 4.20V, 0% @ 3.30V.
-// Charger holds the cell at ~4.20V on USB, so it'll read ~100% while plugged in.
+// LiPo discharge curve (typical 1S cell at light load, ~250 mA draw).
+// The cell holds ~4.0–4.2 V for the first ~30 % of capacity, then sits
+// near 3.7–3.8 V for the bulk, then drops rapidly below 3.6 V — so the
+// old linear 3.3–4.2 V mapping was very wrong in the middle of the curve.
+// Pairs of {volts, percent} sorted descending. Linear-interpolated.
 static int read_battery_percent() {
     float v = read_battery_voltage();
-    if (v >= 4.20f) return 100;
-    if (v <= 3.30f) return 0;
-    return (int)((v - 3.30f) / 0.90f * 100.0f + 0.5f);
+    static const float CURVE[][2] = {
+        {4.20f, 100}, {4.15f, 95}, {4.10f, 90}, {4.05f, 85},
+        {4.00f, 80},  {3.95f, 73}, {3.90f, 65}, {3.85f, 58},
+        {3.80f, 50},  {3.75f, 42}, {3.70f, 33}, {3.65f, 23},
+        {3.60f, 14},  {3.55f, 8},  {3.50f, 5},  {3.40f, 2},
+        {3.30f, 0},
+    };
+    if (v >= CURVE[0][0]) return 100;
+    int last = sizeof(CURVE)/sizeof(CURVE[0]) - 1;
+    if (v <= CURVE[last][0]) return 0;
+    for (int i = 0; i < last; ++i) {
+        float v_hi = CURVE[i][0], v_lo = CURVE[i+1][0];
+        if (v <= v_hi && v >= v_lo) {
+            float p_hi = CURVE[i][1], p_lo = CURVE[i+1][1];
+            float t = (v - v_lo) / (v_hi - v_lo);
+            return (int)(p_lo + t * (p_hi - p_lo) + 0.5f);
+        }
+    }
+    return 0;
+}
+
+// Charging detection — voltage trend over a ~60 s window. The CHRG/STDBY
+// pins of the HX6610S charge IC are wired to LEDs only on V2.3, not to
+// any ESP32 GPIO, so we infer charging from the cell voltage going up.
+// Returns true when voltage has risen by ≥ 5 mV over the last 30 s, or
+// when it's pinned at the charger's float voltage (≥ 4.18 V).
+static float g_batt_trend_v_prev = 0.0f;
+static uint32_t g_batt_trend_ts_prev = 0;
+static bool g_batt_charging = false;
+static void update_charging_state() {
+    float v = read_battery_voltage();
+    uint32_t now = millis();
+    if (g_batt_trend_ts_prev == 0) {
+        g_batt_trend_v_prev = v;
+        g_batt_trend_ts_prev = now;
+        return;
+    }
+    uint32_t dt_ms = now - g_batt_trend_ts_prev;
+    if (dt_ms < 30000) return;   // sample only every 30 s
+    float dv = v - g_batt_trend_v_prev;
+    bool was_charging = g_batt_charging;
+    if (v >= 4.18f) g_batt_charging = true;          // float-charge
+    else if (dv >= 0.005f) g_batt_charging = true;   // visible rise
+    else if (dv <= -0.002f) g_batt_charging = false; // clear discharge
+    if (was_charging != g_batt_charging) {
+        Serial.printf("[BAT] charging=%d v=%.3f dv=%+.3f\n",
+                      (int)g_batt_charging, v, dv);
+    }
+    g_batt_trend_v_prev = v;
+    g_batt_trend_ts_prev = now;
 }
 
 // Load g_settings from /settings.json on SD; falls back to defaults if missing.
@@ -1460,9 +1514,13 @@ static void draw_rect_rounded(int x0, int y0, int x1, int y1, int r,
 }
 
 // Bumped on every render and every touch / button event. The loop uses
-// it to decide when it's safe to enter light sleep — long gaps between
-// interactions are fine to nap through.
+// it to drive auto-sleep: after AUTO_SLEEP_MINUTES of no interaction in
+// any reading-related mode (book / library / TOC / bookmark / TODO),
+// enter deep sleep automatically. AP mode is exempt because the user is
+// actively transferring files and the panel is showing a code/QR they
+// may be reading off-screen.
 static uint32_t g_last_interact_ms = 0;
+static const uint32_t AUTO_SLEEP_MS = 5UL * 60UL * 1000UL;   // 5 min
 
 // Set by render_book_page() / render_book_list() / etc. just before the
 // CPU-side rendering kicks off; used by flush_framebuffer() to report
@@ -1544,7 +1602,8 @@ static void draw_selection_marker(int x, int y_top, int size, uint8_t *fb) {
 
 // Battery-shaped icon: outline rectangle with a small tip on the right and a
 // fill bar proportional to pct. Positioned with x0 at the left edge,
-// vertically centred around y_centre.
+// vertically centred around y_centre. When charging, draws a small lightning
+// bolt over the fill so the user can see USB power is doing its job.
 static void draw_battery_icon(int x0, int y_centre, int pct, uint8_t *fb) {
     const int W = 32, H = 14;
     int top = y_centre - H / 2;
@@ -1561,6 +1620,42 @@ static void draw_battery_icon(int x0, int y_centre, int pct, uint8_t *fb) {
     int max_w = W - 4;
     int fill_w = (pct < 0 ? 0 : pct > 100 ? 100 : pct) * max_w / 100;
     if (fill_w > 0) fill_rect(left + 2, top + 2, left + 2 + fill_w, bot - 1, fb);
+
+    // Lightning bolt overlay when charging — drawn in white-on-fill so it
+    // shows up against the dark fill bar; on the empty portion it draws as
+    // a black outline. Centered vertically in the icon body.
+    if (g_batt_charging) {
+        int cx = left + W / 2;
+        int cy = (top + bot) / 2;
+        // Two diagonal strokes shaped like ⚡ — coordinates relative to (cx,cy).
+        // Each "stroke" is a short filled wedge for visibility at this scale.
+        // Erase a 2×2 rectangle around each bolt pixel so the bolt reads on
+        // any fill level.
+        const int8_t bolt[][2] = {
+            { 1, -5}, { 0, -3}, {-1, -1}, { 1, -1}, { 0,  1},
+            {-1,  3}, { 0,  5},
+        };
+        // First erase (white) under the bolt path so it's visible.
+        for (auto &p : bolt) {
+            int px = cx + p[0], py = cy + p[1];
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int x = px + dx, y = py + dy;
+                    if (x <= left + 1 || x >= right - 1) continue;
+                    if (y <= top + 1  || y >= bot - 1)   continue;
+                    int idx = (y * EPD_WIDTH + x) / 2;
+                    fb[idx] |= (x & 1) ? 0x0F : 0xF0;
+                }
+        }
+        // Then draw the bolt itself in black.
+        for (auto &p : bolt) {
+            int px = cx + p[0], py = cy + p[1];
+            if (px <= left + 1 || px >= right - 1) continue;
+            if (py <= top + 1  || py >= bot - 1)   continue;
+            int idx = (py * EPD_WIDTH + px) / 2;
+            fb[idx] &= (px & 1) ? 0x0F : 0xF0;
+        }
+    }
 }
 
 // Strip the .epub extension from the selected book filename; "Foo.epub" -> "Foo".
@@ -1621,6 +1716,7 @@ static void render_book_page() {
         if (fill_w > 0)
             draw_hline(track_y, divider_x0, divider_x0 + fill_w, framebuffer);
     }
+    update_charging_state();   // sample voltage trend on each render
     int batt_pct = read_battery_percent();
 
     // Layout: chapter (left) | page X/Y (center) | battery icon + % (right).
@@ -2901,6 +2997,30 @@ static void exit_ap_mode() {
     render_book_list();
 }
 
+// Render the centered logo + "tiny-reader" title into the framebuffer.
+// Used by both the cold-boot/wake splash and the deep-sleep screen so
+// the device shows the same identity face when off as when starting up.
+static void render_splash_to_framebuffer() {
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    const GFXfont *body = (GFXfont *)&FiraSans;
+    const char *title   = "tiny-reader";
+
+    const int GAP_LOGO_TITLE = 40;
+    int title_h = 50;   // FiraSans cap height ~ this
+    int stack_h = LOGO_H + GAP_LOGO_TITLE + title_h;
+    int stack_top = (EPD_HEIGHT - stack_h) / 2;
+
+    int logo_x = (EPD_WIDTH - LOGO_W) / 2;
+    int logo_y = stack_top;
+    blit_1bit(logo_x, logo_y, LOGO_W, LOGO_H, LOGO_BITMAP, framebuffer);
+
+    int32_t mx = 0, my = 0, mx1, my1, mw, mh;
+    get_text_bounds(body, title, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
+    int32_t tx = (EPD_WIDTH - mw) / 2;
+    int32_t ty = logo_y + LOGO_H + GAP_LOGO_TITLE + title_h;
+    writeln(body, title, &tx, &ty, framebuffer);
+}
+
 // ---- setup / loop ----
 
 void setup() {
@@ -2933,27 +3053,10 @@ void setup() {
     // ---- Boot splash ----
     // Logo + "tiny-reader", centered. Drawn once on cold boot or
     // wake-from-sleep, then overwritten by the first real render (library
-    // or auto-resumed book).
+    // or auto-resumed book). Same render is used as the deep-sleep screen
+    // — see render_splash_to_framebuffer().
     {
-        memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
-        const GFXfont *body  = (GFXfont *)&FiraSans;
-        const char *title    = "tiny-reader";
-
-        const int GAP_LOGO_TITLE = 40;
-        int title_h = 50;   // FiraSans cap height ~ this
-        int stack_h = LOGO_H + GAP_LOGO_TITLE + title_h;
-        int stack_top = (EPD_HEIGHT - stack_h) / 2;
-
-        int logo_x = (EPD_WIDTH - LOGO_W) / 2;
-        int logo_y = stack_top;
-        blit_1bit(logo_x, logo_y, LOGO_W, LOGO_H, LOGO_BITMAP, framebuffer);
-
-        int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-        get_text_bounds(body, title, &mx, &my, &mx1, &my1, &mw, &mh, NULL);
-        int32_t tx = (EPD_WIDTH - mw) / 2;
-        int32_t ty = logo_y + LOGO_H + GAP_LOGO_TITLE + title_h;
-        writeln(body, title, &tx, &ty, framebuffer);
-
+        render_splash_to_framebuffer();
         epd_poweron();
         epd_clear();
         epd_draw_grayscale_image(epd_full_screen(), framebuffer);
@@ -3038,12 +3141,38 @@ void setup() {
     clear_and_flush();
 
     // If the last shutdown was from sleep while reading a book, auto-resume.
+    // Also pull out the voltage-at-sleep so we can log dV/dt for an average
+    // sleep-current estimate. We don't have wall-clock; deep-sleep wake gives
+    // us esp_sleep_get_wakeup_cause() but not duration. Using the difference
+    // in cell voltage divided by the elapsed seconds (as reported by the RTC
+    // SLOW_CLK survives deep sleep) gives a rough mA estimate.
     bool resumed_from_sleep = false;
     {
         Preferences prefs;
         prefs.begin("tinyreader", true);   // read-only
         String last = prefs.getString("last_book", "");
+        float v_at_sleep = prefs.getFloat("v_at_sleep", -1.0f);
         prefs.end();
+        if (v_at_sleep > 0) {
+            float v_now = read_battery_voltage();
+            float dv = v_now - v_at_sleep;   // negative = drained
+            // Approximate energy ratio per mV — for a 2000 mAh cell discharging
+            // 4.2 V → 3.3 V (≈900 mV span), each mV ≈ 2.2 mAh consumed. So:
+            //   est_mAh = -dv * 1000 * (2000 / 900)  (only meaningful if dv<0)
+            // Average current = est_mAh / hours_slept. We don't know hours, so
+            // just emit dv and the inferred draw if possible. Boot-second from
+            // millis() approximates wake time (cleared on each boot).
+            float boot_sec = millis() / 1000.0f;
+            Serial.printf("[BAT] wake: v_at_sleep=%.3f v_now=%.3f dv=%+.3f "
+                          "boot=%.1fs\n",
+                          v_at_sleep, v_now, dv, boot_sec);
+            if (dv < -0.001f) {
+                // We can't tell sleep duration from inside firmware (RTC
+                // resets unless we set rtc_time_set_us). Just note the drop.
+                Serial.printf("[BAT] sleep drain est: %.1f%% capacity used\n",
+                              -dv / 0.9f * 100.0f);
+            }
+        }
         Serial.printf("[WAKE] NVS last_book = '%s' (%d bytes)\n",
                       last.c_str(), last.length());
         if (last.length() > 0) {
@@ -3092,74 +3221,24 @@ static void enter_deep_sleep() {
         prefs.remove("last_book");
         Serial.println("[SLEEP] cleared last_book NVS");
     }
+    // Capture voltage + RTC time at sleep entry so the next boot can compute
+    // dV/dt and back-derive average sleep current. Stored in millivolts and
+    // milliseconds-since-boot — RTC is reset by deep sleep, but with a known
+    // boot epoch in seconds (esp_timer_get_time()) we can reconstruct duration
+    // by subtracting at wake.
+    {
+        float v = read_battery_voltage();
+        prefs.putFloat("v_at_sleep", v);
+        prefs.putULong64("us_at_sleep", esp_timer_get_time());
+        Serial.printf("[SLEEP] battery v=%.3fV stored for dV/dt\n", v);
+    }
     prefs.end();
 
-    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
-
-    // If we were reading a book and have a cached cover thumb, render it
-    // big and centered as the screensaver. e-paper holds the image with
-    // zero power until next wake. Falls back to the plain "Sleeping…"
-    // text if no cover is available.
-    bool drew_cover = false;
-    if (app_mode == MODE_BOOK && selected >= 0 &&
-        selected < (int)books.size()) {
-        String thumb_path = thumb_path_for_name(String(books[selected].c_str()));
-        File tf = SD.open(thumb_path, FILE_READ);
-        if (tf && tf.size() == (long)THUMB_BYTES) {
-            static uint8_t thumb_buf[THUMB_BYTES];
-            tf.read(thumb_buf, THUMB_BYTES);
-            tf.close();
-            // Nearest-neighbor 4x upscale → ~320×440. Centered.
-            const int scale = 4;
-            int big_w = THUMB_W * scale;
-            int big_h = THUMB_H * scale;
-            int sx = (EPD_WIDTH - big_w) / 2;
-            int sy = (EPD_HEIGHT - big_h) / 2 - 20;   // slight upward shift
-            for (int y = 0; y < big_h; ++y) {
-                int srcY = y / scale;
-                for (int x = 0; x < big_w; ++x) {
-                    int srcX = x / scale;
-                    int idx = (srcY * THUMB_W + srcX) / 2;
-                    uint8_t nib = (srcX & 1) ? (thumb_buf[idx] >> 4)
-                                             : (thumb_buf[idx] & 0x0F);
-                    int dx = sx + x, dy = sy + y;
-                    if (dx < 0 || dx >= EPD_WIDTH || dy < 0 || dy >= EPD_HEIGHT)
-                        continue;
-                    int fbidx = (dy * EPD_WIDTH + dx) / 2;
-                    if (dx & 1)
-                        framebuffer[fbidx] = (framebuffer[fbidx] & 0x0F) |
-                                             (nib << 4);
-                    else
-                        framebuffer[fbidx] = (framebuffer[fbidx] & 0xF0) | nib;
-                }
-            }
-            // Title under the cover.
-            const GFXfont *small = (const GFXfont *)&firasans_small;
-            std::string t = books[selected];
-            size_t dot = t.rfind(".epub");
-            if (dot != std::string::npos) t.erase(dot);
-            if (t.size() > 48) t = t.substr(0, 45) + "...";
-            int32_t mx = 0, my = 0, mx1, my1, mw, mh;
-            get_text_bounds(small, t.c_str(), &mx, &my, &mx1, &my1,
-                            &mw, &mh, NULL);
-            int32_t tx = (EPD_WIDTH - mw) / 2;
-            int32_t ty = sy + big_h + 36;
-            writeln(small, t.c_str(), &tx, &ty, framebuffer);
-            drew_cover = true;
-        } else if (tf) {
-            tf.close();
-        }
-    }
-    if (!drew_cover) {
-        int32_t cx = 60, cy = 200;
-        writeln((GFXfont *)&FiraSans, "Sleeping", &cx, &cy, framebuffer);
-        cx = 60; cy = 280;
-        writeln((GFXfont *)&FiraSans,
-                "Press the button to wake.", &cx, &cy, framebuffer);
-        cx = 60; cy = 340;
-        writeln((GFXfont *)&FiraSans,
-                "(Your reading position is saved.)", &cx, &cy, framebuffer);
-    }
+    // Show the same logo + "tiny-reader" splash as the boot screen, so the
+    // device looks identical when off, sleeping, and starting up. e-paper
+    // holds the image with zero power. Cover-as-screensaver was removed
+    // — user preference is for the consistent identity face.
+    render_splash_to_framebuffer();
     flush_framebuffer(/*force_full=*/true, "sleep");
 
     // Wait for the button to be released before arming wake — otherwise ext0
@@ -3231,6 +3310,33 @@ static void handle_serial_commands() {
                 exit_ap_mode();
             } else if (cmd == "sleep") {
                 enter_deep_sleep();   // does not return
+            } else if (cmd == "bat") {
+                float v = read_battery_voltage();
+                int p = read_battery_percent();
+                Serial.printf("[BAT] v=%.3fV pct=%d charging=%d\n",
+                              v, p, (int)g_batt_charging);
+            } else if (cmd.startsWith("bat_log ")) {
+                // bat_log <interval_sec> <duration_min> — periodic voltage
+                // logger for offline analysis. Block-loops; use Ctrl-C to
+                // abort, or wait for the duration.
+                int sp = cmd.indexOf(' ', 8);
+                int interval_sec = cmd.substring(8, sp > 0 ? sp : cmd.length()).toInt();
+                int duration_min = sp > 0 ? cmd.substring(sp + 1).toInt() : 60;
+                if (interval_sec < 1) interval_sec = 5;
+                if (duration_min < 1) duration_min = 60;
+                Serial.printf("[BAT] logging every %ds for %d min, "
+                              "Ctrl-C to abort\n", interval_sec, duration_min);
+                uint32_t end_at = millis() + duration_min * 60UL * 1000UL;
+                while (millis() < end_at) {
+                    float v = read_battery_voltage();
+                    int p = read_battery_percent();
+                    update_charging_state();
+                    Serial.printf("[BAT] t=%us v=%.3f pct=%d ch=%d\n",
+                                  (unsigned)(millis() / 1000), v, p,
+                                  (int)g_batt_charging);
+                    delay(interval_sec * 1000);
+                }
+                Serial.println("[BAT] log done");
             } else if (cmd == "probe_buttons") {
                 Serial.println("[PROBE] press each button. Listening for 30s.");
                 const int pins[] = {0, 10, 14, 21, 38, 39, 45, 48};
@@ -3258,7 +3364,7 @@ static void handle_serial_commands() {
                 g_clear_cycles = cmd[1] - '0';
                 Serial.printf("[CFG] clear cycles -> %d\n", g_clear_cycles);
             } else if (cmd == "help") {
-                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share sleep probe_buttons c1..c4 help");
+                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share sleep bat bat_log <s> <m> probe_buttons c1..c4 help");
             } else {
                 Serial.printf("[ERR] unknown cmd: %s\n", cmd.c_str());
             }
@@ -3275,6 +3381,21 @@ void loop() {
     uint32_t now = millis();
 
     handle_serial_commands();
+
+    // Auto-sleep: after AUTO_SLEEP_MS of inactivity in any reading-related
+    // mode, drop to deep sleep. AP mode is exempt — the user is actively
+    // transferring files and may need the SSID/QR on screen for a while.
+    // Wrap-safe: if g_last_interact_ms is "in the future" (cross-core
+    // millis() race like the AP-idle path saw), treat as fresh activity.
+    if (!ap_active && g_last_interact_ms != 0) {
+        uint32_t idle_ms = (now >= g_last_interact_ms)
+                           ? (now - g_last_interact_ms) : 0;
+        if (idle_ms > AUTO_SLEEP_MS) {
+            Serial.printf("[SLEEP] auto-sleep after %u ms idle\n",
+                          (unsigned)idle_ms);
+            enter_deep_sleep();   // does not return
+        }
+    }
 
     // STR_100 polling outside renders. The EPD is idle between renders
     // (every render ends with epd_poweroff), so it's safe to briefly flip
@@ -3326,22 +3447,28 @@ void loop() {
             exit_ap_mode();
             return;
         }
-        // To exit: button must be held LOW for ≥1500ms. First 3s after entering
-        // ignore the button so the long-press that entered won't auto-exit.
+        // To exit: any short press of the button. We trigger on release
+        // (HIGH transition) rather than press so the user can let go and
+        // see the device immediately leave AP. First 3 s after entering
+        // ignore the button so the long-press that entered AP doesn't
+        // auto-exit on its own release.
         if (now - ap_started_at > 3000) {
-            static uint32_t btn_low_since = 0;
-            if (digitalRead(BUTTON_1) == LOW) {
-                if (btn_low_since == 0) btn_low_since = now;
-                if (now - btn_low_since > 1500) {
-                    Serial.println("[AP] button-hold exit");
-                    btn_low_since = 0;
+            static bool btn_was_low = false;
+            static uint32_t btn_press_at = 0;
+            bool now_low = (digitalRead(BUTTON_1) == LOW);
+            if (now_low && !btn_was_low) {
+                btn_press_at = now;
+            } else if (!now_low && btn_was_low) {
+                // 50 ms minimum to debounce contact bounce.
+                if (now - btn_press_at > 50) {
+                    Serial.println("[AP] button-press exit");
+                    btn_was_low = false;
                     exit_ap_mode();
                     input_cooldown_until = millis() + 1000;
                     return;
                 }
-            } else {
-                btn_low_since = 0;
             }
+            btn_was_low = now_low;
         }
         vTaskDelay(pdMS_TO_TICKS(5));
         return;
