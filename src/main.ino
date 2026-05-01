@@ -1996,7 +1996,6 @@ static void render_book_list() {
 
         int row = 0;
         for (size_t i = page_first; i < books.size() && row < LINES_PER_PAGE; ++i, ++row) {
-            bool sel = ((int)i == selected);
             int32_t baseline = LIST_Y + 110 + row * LIB_ROW_HEIGHT;
 
             // Cover thumbnail (cached 4-bit raw on SD as <bookname>.thumb).
@@ -2031,17 +2030,16 @@ static void render_book_list() {
                 tf.close();
             }
 
-            // Cursor sprite (filled triangle) + title. The right edge of
-            // the title must clear the right-side state column (time
-            // estimate + progress bar = ~190 px before RIGHT_X).
+            // Title only — the selection-cursor triangle was removed once
+            // direct row-tap became the way to open a book; there's no
+            // longer a "selected but not yet opened" state worth showing.
+            // Right edge of title must clear the right-side state column
+            // (time estimate + progress bar = ~190 px before RIGHT_X).
             std::string title = books[i];
             size_t dot = title.rfind(".epub");
             if (dot != std::string::npos) title.erase(dot);
             if (title.size() > 28) title = title.substr(0, 25) + "...";
-            if (sel) {
-                draw_selection_marker(TEXT_LEFT, baseline - 28, 24, framebuffer);
-            }
-            int32_t tx = TEXT_LEFT + 36, ty = baseline;
+            int32_t tx = TEXT_LEFT, ty = baseline;
             writeln(body, title.c_str(), &tx, &ty, framebuffer);
 
             // Right-side tri-state: not-started (hollow pill), reading
@@ -2300,6 +2298,24 @@ static int chapter_jump_hit_test(int16_t x, int16_t y) {
     Serial.printf("[CJ] tap (%d,%d) -> row=%d toc[%d]='%s' spine=%d\n",
                   x, y, row, idx, g_toc_cache[idx].title.c_str(),
                   g_toc_cache[idx].spine_index);
+    return idx;
+}
+
+// Convert a tap in the library view into a book index, or -1 if the tap
+// missed every row. Touch Y is inverted relative to render Y. Row metrics
+// must match render_book_list() — same baseline + LIB_ROW_HEIGHT.
+static int library_hit_test(int16_t x, int16_t y) {
+    if (books.empty()) return -1;
+    int screen_y = EPD_HEIGHT - 1 - y;
+    const int LIB_ROW_HEIGHT = 64;
+    // Rows in render coordinates: baseline = LIST_Y + 110 + row * 64. The
+    // visual band of a row starts ~30 px above its baseline.
+    int rows_top = LIST_Y + 110 - 30;
+    int rows_bot = rows_top + LINES_PER_PAGE * LIB_ROW_HEIGHT;
+    if (screen_y < rows_top || screen_y >= rows_bot) return -1;
+    int row = (screen_y - rows_top) / LIB_ROW_HEIGHT;
+    int idx = page_first + row;
+    if (idx < 0 || idx >= (int)books.size()) return -1;
     return idx;
 }
 
@@ -3643,9 +3659,20 @@ void loop() {
                         Serial.println("[TAP] bottom-right -> TODO view");
                         app_mode = MODE_TODO;
                         render_todo_list();
-                    } else if (zone == 1) move_selection(-1);
-                    else if (zone == 3) move_selection(+1);
-                    else if (zone == 2) open_selected();
+                    } else {
+                        // Direct-tap any book row to open it. Falls back
+                        // to prev/next selection or open-selected when the
+                        // tap missed every row (e.g. tapped in a margin
+                        // or between rows).
+                        int idx = library_hit_test(xs[0], ys[0]);
+                        if (idx >= 0) {
+                            selected = idx;
+                            Serial.printf("[TAP] library row %d -> open\n", idx);
+                            open_selected();
+                        } else if (zone == 1) move_selection(-1);
+                        else if (zone == 3) move_selection(+1);
+                        else if (zone == 2) open_selected();
+                    }
                 }
                 // Debounce window measured from the originating tap, not
                 // from "now" (which is post-render). 300 ms keeps stray
