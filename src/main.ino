@@ -59,8 +59,25 @@ extern "C" {
 
 // ---- globals ----
 static uint8_t *framebuffer = nullptr;
+// Number of clear cycles per refresh. epdiy default is 4 (~1.35 s clear
+// for full screen on this panel). 1 cycle drops it to ~315 ms with no
+// visible ghost on the ED047TC1 — verified empirically across 5–10
+// pages of dense text. Configurable via serial commands c1/c2/c3/c4.
+static int g_clear_cycles = 1;
 static TouchDrvGT911 touch;
 static bool touchOnline = false;
+
+// Background touch poller. Runs on core 0 every ~15 ms so taps are captured
+// even while loop() is blocked inside an EPD waveform (~900 ms per page
+// turn). Each press-edge (no-touch → touch) is enqueued as one TouchTap;
+// loop() drains the queue. Touch I2C is on its own bus, separate from the
+// EPD parallel bus, so the two run independently.
+struct TouchTap {
+    int16_t x;
+    int16_t y;
+    uint32_t t_ms;
+};
+static QueueHandle_t g_touch_queue = nullptr;
 
 enum AppMode { MODE_LIBRARY, MODE_BOOK, MODE_TODO, MODE_CHAPTER_JUMP,
                MODE_BOOK_END, MODE_BOOKMARK_LIST };
@@ -847,6 +864,19 @@ static void chapter_load_task(void *param) {
     if (r->ok) {
         r->spine_n = epub.get_spine_items_count();
         r->title = epub.get_title();
+        if (r->title.empty()) {
+            // EPUB had no <dc:title>; use the filename (sans .epub) so the
+            // UI has something to show. r->path is "/Foo Bar.epub".
+            std::string p = r->path;
+            size_t slash = p.find_last_of('/');
+            std::string base = (slash != std::string::npos)
+                               ? p.substr(slash + 1) : p;
+            if (base.size() >= 5 &&
+                base.compare(base.size() - 5, 5, ".epub") == 0) {
+                base.resize(base.size() - 5);
+            }
+            r->title = base;
+        }
         // Capture the NCX TOC mapping spine -> chapter title.
         int ntoc = epub.get_toc_items_count();
         r->toc.reserve(ntoc);
@@ -1434,18 +1464,45 @@ static void draw_rect_rounded(int x0, int y0, int x1, int y1, int r,
 // interactions are fine to nap through.
 static uint32_t g_last_interact_ms = 0;
 
-// Push the current framebuffer to the EPD. Always does an epd_clear()
-// flash first — without it, the e-paper retains previous content and
-// each render layers on top. True diff-based partial refresh would need
-// epdiy's hi-level API which our vendored LilyGo lib doesn't expose.
-// The `force_full` arg is kept for callers that pass it, but the
-// behaviour is the same in both cases now.
-static void flush_framebuffer(bool force_full = false) {
+// Set by render_book_page() / render_book_list() / etc. just before the
+// CPU-side rendering kicks off; used by flush_framebuffer() to report
+// how long layout+draw took relative to the e-paper waveform.
+static uint32_t g_pt_layout_start_ms = 0;
+
+// Push the current framebuffer to the EPD. Always full-screen — the
+// per-page diff/region path was tested and removed because the typical
+// text page changes ~93 % of vertical rows (body + page-number footer +
+// progress line), so the savings were ~5 % and not worth the complexity.
+// The big lever is g_clear_cycles, which scales clear time linearly.
+//
+// Logs:
+//   [FLUSH] tag=X layout=Aa pwr=Pp clr=Cc draw=Dd off=Oo total=Tt cy=K
+// where layout = ms from caller setting g_pt_layout_start_ms to the
+// flush call, pwr/clr/draw/off are the four epd_* phases, total is
+// wall-clock from layout-start to flush-end, cy is the active cycle count.
+static void flush_framebuffer(bool force_full = false, const char *tag = "?") {
     (void)force_full;
+    uint32_t t_flush_in = millis();
+    uint32_t layout_ms = (g_pt_layout_start_ms != 0)
+                         ? (t_flush_in - g_pt_layout_start_ms) : 0;
+    uint32_t t0 = millis();
     epd_poweron();
-    epd_clear();
+    uint32_t t1 = millis();
+    epd_clear_area_cycles(epd_full_screen(), g_clear_cycles, 50);
+    uint32_t t2 = millis();
     epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    uint32_t t3 = millis();
     epd_poweroff();
+    uint32_t t4 = millis();
+    Serial.printf("[FLUSH] tag=%s layout=%ums pwr=%ums clr=%ums "
+                  "draw=%ums off=%ums total=%ums cy=%d\n",
+                  tag, (unsigned)layout_ms,
+                  (unsigned)(t1 - t0), (unsigned)(t2 - t1),
+                  (unsigned)(t3 - t2), (unsigned)(t4 - t3),
+                  (unsigned)(t4 - (g_pt_layout_start_ms ?
+                                   g_pt_layout_start_ms : t0)),
+                  g_clear_cycles);
+    g_pt_layout_start_ms = 0;
     g_last_interact_ms = millis();
 }
 
@@ -1521,6 +1578,7 @@ static void render_book_page() {
     if (current_page_in_chapter >= (int)chapter_pages.size())
         current_page_in_chapter = chapter_pages.size() - 1;
     dump_current_page_to_serial();
+    g_pt_layout_start_ms = millis();
 
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
     // (no header strip — body uses the full vertical space; the top 80px is
@@ -1600,9 +1658,7 @@ static void render_book_page() {
     writeln(small, right, &rx_text, &ry, framebuffer);
     draw_battery_icon(text_start_x - 42, footer_y - 9, batt_pct, framebuffer);
 
-    // Page turn: skip the white flash on most renders; full clear every
-    // FULL_REFRESH_EVERY turns to wash out accumulated ghosting.
-    flush_framebuffer(/*force_full=*/false);
+    flush_framebuffer(/*force_full=*/false, "book");
 
     // EPD is now electrically idle — safe window to peek at GPIO 0 (STR_100).
     // We latch a flag rather than acting here so loop() consumes it.
@@ -1636,7 +1692,7 @@ static void render_book_end() {
 
     // (no footer hints on the end screen — feels nicer to land on)
 
-    flush_framebuffer(/*force_full=*/true);
+    flush_framebuffer(/*force_full=*/true, "book_end");
 }
 
 // Advance/go-back a page; cross chapter boundaries by loading next/prev spine item.
@@ -1957,7 +2013,7 @@ static void render_book_list() {
 
     draw_corner_icon(TODO_LOGO_BITMAP, TODO_LOGO_W, TODO_LOGO_H, 4);
 
-    flush_framebuffer(/*force_full=*/true);
+    flush_framebuffer(/*force_full=*/true, "lib");
 
     // Same idle-window peek as render_book_page(). In library mode the latch
     // is a debug-log only (see loop()), but we still keep it warm so the user
@@ -2037,7 +2093,7 @@ static void render_chapter_jump() {
 
     // (footer hints intentionally removed)
 
-    flush_framebuffer(/*force_full=*/true);
+    flush_framebuffer(/*force_full=*/true, "chap_jump");
 }
 
 // Bookmark list view: one row per saved bookmark, like chapter-jump but
@@ -2117,7 +2173,7 @@ static void render_bookmark_list() {
         }
     }
 
-    flush_framebuffer(/*force_full=*/true);
+    flush_framebuffer(/*force_full=*/true, "bm_list");
 }
 
 // Tap → bookmark index, or -1 if outside.
@@ -2217,7 +2273,7 @@ static void render_todo_list() {
 
     draw_corner_icon(LOGO_BITMAP, LOGO_W, LOGO_H, 4);
 
-    flush_framebuffer(/*force_full=*/true);
+    flush_framebuffer(/*force_full=*/true, "todo");
 }
 
 static void move_selection(int delta) {
@@ -2410,7 +2466,7 @@ static void render_ap_screen() {
         writeln(small, msg, &lx, &ly, framebuffer);
     }
 
-    flush_framebuffer(/*force_full=*/true);
+    flush_framebuffer(/*force_full=*/true, "ap");
 }
 
 // Async handlers below take AsyncWebServerRequest *req.
@@ -2923,6 +2979,34 @@ void setup() {
         touch.setMirrorXY(false, false);
         touch.setSwapXY(true);
         Serial.printf("GT911 ok at 0x%02X\n", touchAddress);
+
+        // Spin up the background touch poller. Queue holds 8 events;
+        // overflow drops oldest taps (better than blocking the polling
+        // task and missing real-time press-edges).
+        g_touch_queue = xQueueCreate(8, sizeof(TouchTap));
+        xTaskCreatePinnedToCore(
+            [](void *) {
+                bool prev_down = false;
+                int16_t last_x = 0, last_y = 0;
+                while (true) {
+                    int16_t xs[5], ys[5];
+                    uint8_t n = touch.getPoint(xs, ys, 1);
+                    bool down = (n > 0);
+                    if (down) { last_x = xs[0]; last_y = ys[0]; }
+                    if (down && !prev_down) {
+                        TouchTap t = {last_x, last_y, millis()};
+                        if (xQueueSend(g_touch_queue, &t, 0) != pdTRUE) {
+                            TouchTap dummy;
+                            xQueueReceive(g_touch_queue, &dummy, 0);
+                            xQueueSend(g_touch_queue, &t, 0);
+                        }
+                    }
+                    prev_down = down;
+                    vTaskDelay(pdMS_TO_TICKS(15));
+                }
+            },
+            "touch_poll", 4096, nullptr, 5, nullptr, 0);
+        Serial.println("[TOUCH] background poller started on core 0");
     } else {
         Serial.println("GT911 init failed — falling back to BUTTON_1");
     }
@@ -3076,7 +3160,7 @@ static void enter_deep_sleep() {
         writeln((GFXfont *)&FiraSans,
                 "(Your reading position is saved.)", &cx, &cy, framebuffer);
     }
-    flush_framebuffer(/*force_full=*/true);
+    flush_framebuffer(/*force_full=*/true, "sleep");
 
     // Wait for the button to be released before arming wake — otherwise ext0
     // sees it still LOW and wakes the chip immediately, looking like sleep
@@ -3167,8 +3251,14 @@ static void handle_serial_commands() {
                     delay(15);
                 }
                 Serial.println("[PROBE] done");
+            } else if (cmd.length() == 2 && cmd[0] == 'c' &&
+                       cmd[1] >= '1' && cmd[1] <= '4') {
+                // c1/c2/c3/c4 — tune clear-cycle count for live A/B testing.
+                // Lower = faster page turns, more chance of accumulated ghost.
+                g_clear_cycles = cmd[1] - '0';
+                Serial.printf("[CFG] clear cycles -> %d\n", g_clear_cycles);
             } else if (cmd == "help") {
-                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share sleep probe_buttons help");
+                Serial.println("commands: next prev back open <n> goto <ch> dump share stop_share sleep probe_buttons c1..c4 help");
             } else {
                 Serial.printf("[ERR] unknown cmd: %s\n", cmd.c_str());
             }
@@ -3257,14 +3347,23 @@ void loop() {
         return;
     }
 
-    // touch — edge-triggered on press (not held)
-    if (touchOnline) {
-        static bool touch_was_down = false;
-        int16_t xs[5], ys[5];
-        uint8_t n = touch.getPoint(xs, ys, 1);
-        if (n > 0) g_last_interact_ms = now;
-        if (n > 0) {
-            if (!touch_was_down && now >= input_cooldown_until) {
+    // touch — drained from the background poller's queue. Each TouchTap
+    // is one press-edge captured by the poller, including taps that
+    // happened while loop() was blocked inside an EPD waveform. Walk
+    // every queued tap so a burst of fast taps during a long render
+    // still gets through.
+    if (touchOnline && g_touch_queue) {
+        TouchTap tap;
+        while (xQueueReceive(g_touch_queue, &tap, 0) == pdTRUE) {
+            // Debounce against the tap's capture time, not millis() — a
+            // tap queued during a 1 s render must not be discarded just
+            // because the render itself outlasted any cooldown set from
+            // the *previous* tap.
+            if (tap.t_ms < input_cooldown_until) continue;
+            int16_t xs[1] = { tap.x };
+            int16_t ys[1] = { tap.y };
+            g_last_interact_ms = tap.t_ms;
+            {
                 int zone = classify_tap(xs[0], ys[0]);
                 Serial.printf("tap (%d,%d) zone=%d mode=%d\n",
                               xs[0], ys[0], zone, app_mode);
@@ -3421,11 +3520,13 @@ void loop() {
                     else if (zone == 3) move_selection(+1);
                     else if (zone == 2) open_selected();
                 }
-                input_cooldown_until = millis() + 300;
+                // Debounce window measured from the originating tap, not
+                // from "now" (which is post-render). 300 ms keeps stray
+                // finger-jitter from registering twice but lets the next
+                // queued tap dispatch immediately.
+                input_cooldown_until = tap.t_ms + 300;
             }
-            touch_was_down = true;
-        } else {
-            touch_was_down = false;
+            // (loop body of `while (queue receive)` ends here)
         }
     }
 

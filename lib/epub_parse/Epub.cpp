@@ -103,12 +103,17 @@ bool Epub::parse_content_opf(ZipFile &zip, std::string &content_opf_file)
     return false;
   }
   auto title = metadata->FirstChildElement("dc:title");
-  if (!title)
+  if (title && title->GetText())
   {
-    ESP_LOGE(TAG, "Missing title");
-    return false;
+    m_title = title->GetText();
   }
-  m_title = title->GetText();
+  else
+  {
+    // Some EPUBs (Sigil 0.7.3, certain Calibre exports) omit <dc:title>
+    // even though the spec requires it. Don't bail — leave m_title empty
+    // and let the caller fall back to the filename.
+    ESP_LOGW(TAG, "Missing title; caller should fall back to filename");
+  }
   auto cover = metadata->FirstChildElement("meta");
   while (cover && cover->Attribute("name") && strcmp(cover->Attribute("name"), "cover") != 0)
   {
